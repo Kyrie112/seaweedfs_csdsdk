@@ -58,6 +58,7 @@ type VolumeServer struct {
 	metricsAddress                string
 	metricsIntervalSec            int
 	fileSizeLimitBytes            int64
+	computeConfig                 VolumeComputeConfig
 	isHeartbeating                bool
 	stopChan                      chan bool
 }
@@ -83,6 +84,7 @@ func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 	readBufferSizeMB int,
 	ldbTimeout int64,
 	allowUntrustedRemoteEndpoints bool,
+	computeConfig VolumeComputeConfig,
 	diskProbeConfig stats.DiskIOProbeConfig,
 ) *VolumeServer {
 
@@ -120,6 +122,7 @@ func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 		ldbTimout:                     ldbTimeout,
 		whiteList:                     whiteList,
 		AllowUntrustedRemoteEndpoints: allowUntrustedRemoteEndpoints,
+		computeConfig:                 computeConfig,
 	}
 
 	whiteList = append(whiteList, util.StringSplit(v.GetString("guard.white_list"), ",")...)

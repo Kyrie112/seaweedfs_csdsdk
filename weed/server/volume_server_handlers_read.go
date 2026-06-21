@@ -185,6 +185,10 @@ func (vs *VolumeServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request)
 	var count int
 	var memoryCost types.Size
 	readOption.AttemptMetaOnly, readOption.MustMetaOnly = shouldAttemptStreamWrite(hasVolume, ext, r)
+	if r.URL.Query().Get(volumeComputeQuery) != "" {
+		readOption.AttemptMetaOnly = false
+		readOption.MustMetaOnly = false
+	}
 	onReadSizeFn := func(size types.Size) {
 		memoryCost = size
 		atomic.AddInt64(&vs.inFlightDownloadDataSize, int64(memoryCost))
@@ -224,6 +228,9 @@ func (vs *VolumeServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request)
 	if n.Cookie != cookie {
 		glog.V(0).Infof("request %s with cookie:%x expected:%x from %s agent %s", r.URL.Path, cookie, n.Cookie, r.RemoteAddr, r.UserAgent())
 		NotFound(w)
+		return
+	}
+	if vs.maybeHandleComputeOperation(w, r, volumeId, n, r.URL.Query().Get(volumeComputeQuery), filename) {
 		return
 	}
 	if n.LastModified != 0 {

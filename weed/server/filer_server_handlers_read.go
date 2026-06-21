@@ -139,6 +139,11 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	if computeOperation := query.Get(volumeComputeQuery); computeOperation != "" {
+		fs.proxyComputeToVolumeServer(w, r, entry, computeOperation)
+		return
+	}
+
 	if checkPreconditions(w, r, entry) {
 		return
 	}

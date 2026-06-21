@@ -75,6 +75,10 @@ type VolumeServerOptions struct {
 	readBufferSizeMB              *int
 	ldbTimeout                    *int64
 	allowUntrustedRemoteEndpoints *bool
+	computeEnabled                *bool
+	computeScriptDir              *string
+	computeTimeout                *time.Duration
+	computeMaxOutputMB            *int
 	debug                         *bool
 	debugPort                     *int
 	diskIOProbe                   *bool
@@ -228,6 +232,10 @@ func init() {
 	v.hasSlowRead = cmdVolume.Flag.Bool("hasSlowRead", true, "<experimental> if true, this prevents slow reads from blocking other requests, but large file read P99 latency will increase.")
 	v.readBufferSizeMB = cmdVolume.Flag.Int("readBufferSizeMB", 4, "<experimental> larger values can optimize query performance but will increase some memory usage,Use with hasSlowRead normally.")
 	v.allowUntrustedRemoteEndpoints = cmdVolume.Flag.Bool("volume.allowUntrustedRemoteEndpoints", false, "if true, FetchAndWriteNeedle accepts arbitrary remote S3 endpoints including loopback / link-local hosts. Default rejects internal / metadata endpoints.")
+	v.computeEnabled = cmdVolume.Flag.Bool("volume.compute.enabled", false, "enable volume-local compute scripts for read requests with ?compute=<operation>")
+	v.computeScriptDir = cmdVolume.Flag.String("volume.compute.dir", "", "directory containing volume compute scripts")
+	v.computeTimeout = cmdVolume.Flag.Duration("volume.compute.timeout", 30*time.Second, "timeout for each volume compute script execution")
+	v.computeMaxOutputMB = cmdVolume.Flag.Int("volume.compute.maxOutputMB", 64, "maximum stdout size in MB for each volume compute script")
 	v.debug = cmdVolume.Flag.Bool("debug", false, "serves runtime profiling data via pprof on the port specified by -debug.port")
 	v.debugPort = cmdVolume.Flag.Int("debug.port", 6060, "http port for debugging")
 	v.setDiskIOProbeDefaults()
@@ -429,6 +437,22 @@ func (v VolumeServerOptions) startVolumeServer(volumeFolders, maxVolumeCounts, v
 		glog.Warningf("disk IO probe is disabled for multiple volume directories: %v", v.folders)
 		diskProbeConfig.Enabled = false
 	}
+	computeEnabled := false
+	if v.computeEnabled != nil {
+		computeEnabled = *v.computeEnabled
+	}
+	computeScriptDir := ""
+	if v.computeScriptDir != nil && *v.computeScriptDir != "" {
+		computeScriptDir = util.ResolvePath(*v.computeScriptDir)
+	}
+	computeTimeout := 30 * time.Second
+	if v.computeTimeout != nil {
+		computeTimeout = *v.computeTimeout
+	}
+	computeMaxOutputMB := 64
+	if v.computeMaxOutputMB != nil {
+		computeMaxOutputMB = *v.computeMaxOutputMB
+	}
 	volumeServer := weed_server.NewVolumeServer(volumeMux, publicVolumeMux,
 		*v.ip, *v.port, *v.portGrpc, *v.publicUrl, volumeServerId,
 		v.folders, v.folderMaxLimits, minFreeSpaces, diskTypes, folderTags,
@@ -448,6 +472,12 @@ func (v VolumeServerOptions) startVolumeServer(volumeFolders, maxVolumeCounts, v
 		*v.readBufferSizeMB,
 		*v.ldbTimeout,
 		*v.allowUntrustedRemoteEndpoints,
+		weed_server.VolumeComputeConfig{
+			Enabled:     computeEnabled,
+			ScriptDir:   computeScriptDir,
+			Timeout:     computeTimeout,
+			MaxOutputMB: computeMaxOutputMB,
+		},
 		diskProbeConfig,
 	)
 	// starting grpc server
