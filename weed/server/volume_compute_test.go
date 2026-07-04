@@ -118,3 +118,56 @@ printf "stdin-bytes=%s\n" "$(cat)"
 		}
 	}
 }
+
+func TestRunComputeScriptPassesStdinInput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script execution test requires /bin/sh")
+	}
+
+	scriptDir := t.TempDir()
+	scriptPath := filepath.Join(scriptDir, "inspect.sh")
+	script := `#!/bin/sh
+printf "arg=%s\n" "$1"
+printf "mode=%s\n" "$SEAWEED_COMPUTE_INPUT_MODE"
+printf "env=%s\n" "$SEAWEED_COMPUTE_INPUT_FILE"
+printf "fd=%s\n" "$SEAWEED_COMPUTE_INPUT_FD"
+printf "stdin-bytes=%s\n" "$(cat)"
+`
+	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	vs := &VolumeServer{
+		computeConfig: VolumeComputeConfig{
+			Enabled:     true,
+			ScriptDir:   scriptDir,
+			Timeout:     5 * time.Second,
+			MaxOutputMB: 1,
+			InputMode:   VolumeComputeInputStdin,
+		},
+	}
+	n := &needle.Needle{
+		Id:       123,
+		Data:     []byte("needle-data"),
+		DataSize: uint32(len("needle-data")),
+		Name:     []byte("source.txt"),
+		Mime:     []byte("text/plain"),
+	}
+
+	output, err := vs.runComputeScript(context.Background(), "inspect", 7, n, "file.txt")
+	if err != nil {
+		t.Fatalf("runComputeScript: %v", err)
+	}
+	got := string(output)
+	for _, want := range []string{
+		"arg=\n",
+		"mode=stdin\n",
+		"env=\n",
+		"fd=0\n",
+		"stdin-bytes=needle-data\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("output missing %q:\n%s", want, got)
+		}
+	}
+}

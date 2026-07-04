@@ -23,9 +23,15 @@ type VolumeComputeConfig struct {
 	ScriptDir   string
 	Timeout     time.Duration
 	MaxOutputMB int
+	InputMode   string
 }
 
 const volumeComputeQuery = "compute"
+
+const (
+	VolumeComputeInputTempFile = "tempfile"
+	VolumeComputeInputStdin    = "stdin"
+)
 
 func (vs *VolumeServer) maybeHandleComputeOperation(w http.ResponseWriter, r *http.Request, volumeId needle.VolumeId, n *needle.Needle, operation string, filename string) bool {
 	if operation == "" {
@@ -98,17 +104,33 @@ func (vs *VolumeServer) runComputeScript(ctx context.Context, operation string, 
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	inputFile, inputPath, cleanup, err := createComputeInputFile(n.Data)
-	if err != nil {
-		return nil, err
+	inputMode := vs.computeConfig.InputMode
+	if inputMode == "" {
+		inputMode = VolumeComputeInputTempFile
 	}
-	defer cleanup()
 
-	cmd := exec.CommandContext(runCtx, scriptPath, inputPath)
-	cmd.Stdin = inputFile
+	var cmd *exec.Cmd
+	var inputPath string
+	switch inputMode {
+	case VolumeComputeInputTempFile:
+		inputFile, path, cleanup, err := createComputeInputFile(n.Data)
+		if err != nil {
+			return nil, err
+		}
+		defer cleanup()
+		inputPath = path
+		cmd = exec.CommandContext(runCtx, scriptPath, inputPath)
+		cmd.Stdin = inputFile
+	case VolumeComputeInputStdin:
+		cmd = exec.CommandContext(runCtx, scriptPath)
+		cmd.Stdin = bytes.NewReader(n.Data)
+	default:
+		return nil, fmt.Errorf("unsupported volume compute input mode %q", inputMode)
+	}
 	cmd.Env = append(os.Environ(),
 		"SEAWEED_COMPUTE_OPERATION="+operation,
 		"SEAWEED_FILE_NAME="+filename,
+		"SEAWEED_COMPUTE_INPUT_MODE="+inputMode,
 		"SEAWEED_COMPUTE_INPUT_FILE="+inputPath,
 		"SEAWEED_COMPUTE_INPUT_FD=0",
 		"SEAWEED_VOLUME_ID="+volumeId.String(),

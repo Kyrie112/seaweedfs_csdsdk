@@ -79,6 +79,7 @@ type VolumeServerOptions struct {
 	computeScriptDir              *string
 	computeTimeout                *time.Duration
 	computeMaxOutputMB            *int
+	computeInputMode              *string
 	debug                         *bool
 	debugPort                     *int
 	diskIOProbe                   *bool
@@ -236,6 +237,7 @@ func init() {
 	v.computeScriptDir = cmdVolume.Flag.String("volume.compute.dir", "", "directory containing volume compute scripts")
 	v.computeTimeout = cmdVolume.Flag.Duration("volume.compute.timeout", 30*time.Second, "timeout for each volume compute script execution")
 	v.computeMaxOutputMB = cmdVolume.Flag.Int("volume.compute.maxOutputMB", 64, "maximum stdout size in MB for each volume compute script")
+	v.computeInputMode = cmdVolume.Flag.String("volume.compute.input", weed_server.VolumeComputeInputTempFile, "input mode for volume compute scripts: tempfile or stdin")
 	v.debug = cmdVolume.Flag.Bool("debug", false, "serves runtime profiling data via pprof on the port specified by -debug.port")
 	v.debugPort = cmdVolume.Flag.Int("debug.port", 6060, "http port for debugging")
 	v.setDiskIOProbeDefaults()
@@ -453,6 +455,15 @@ func (v VolumeServerOptions) startVolumeServer(volumeFolders, maxVolumeCounts, v
 	if v.computeMaxOutputMB != nil {
 		computeMaxOutputMB = *v.computeMaxOutputMB
 	}
+	computeInputMode := weed_server.VolumeComputeInputTempFile
+	if v.computeInputMode != nil && *v.computeInputMode != "" {
+		computeInputMode = strings.ToLower(strings.TrimSpace(*v.computeInputMode))
+	}
+	switch computeInputMode {
+	case weed_server.VolumeComputeInputTempFile, weed_server.VolumeComputeInputStdin:
+	default:
+		glog.Fatalf("invalid -volume.compute.input %q, expected %q or %q", computeInputMode, weed_server.VolumeComputeInputTempFile, weed_server.VolumeComputeInputStdin)
+	}
 	volumeServer := weed_server.NewVolumeServer(volumeMux, publicVolumeMux,
 		*v.ip, *v.port, *v.portGrpc, *v.publicUrl, volumeServerId,
 		v.folders, v.folderMaxLimits, minFreeSpaces, diskTypes, folderTags,
@@ -477,6 +488,7 @@ func (v VolumeServerOptions) startVolumeServer(volumeFolders, maxVolumeCounts, v
 			ScriptDir:   computeScriptDir,
 			Timeout:     computeTimeout,
 			MaxOutputMB: computeMaxOutputMB,
+			InputMode:   computeInputMode,
 		},
 		diskProbeConfig,
 	)

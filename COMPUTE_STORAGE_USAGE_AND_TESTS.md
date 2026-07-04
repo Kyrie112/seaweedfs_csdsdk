@@ -47,7 +47,13 @@ The Volume server is started with:
 -volume.compute.dir=/home/ubuntu/csd-test/scripts
 -volume.compute.timeout=20s
 -volume.compute.maxOutputMB=16
+-volume.compute.input=tempfile
 ```
+
+`-volume.compute.input` controls how the needle data is supplied to the
+script. The default `tempfile` mode keeps the original behavior. The `stdin`
+mode avoids creating a temporary input file and streams the already-read needle
+data to the script through fd 0.
 
 For a request:
 
@@ -67,14 +73,15 @@ are rejected.
 
 ## 3. Script Input Contract
 
-Before executing the script, the Volume server materializes the needle data as a
-temporary file.
+By default, before executing the script, the Volume server materializes the
+needle data as a temporary file.
 
 The script receives the input in three ways:
 
 ```text
 argv[1]                         temporary input file path
 stdin / fd 0                    opened input file handle
+SEAWEED_COMPUTE_INPUT_MODE      tempfile
 SEAWEED_COMPUTE_INPUT_FILE      temporary input file path
 SEAWEED_COMPUTE_INPUT_FD        0
 SEAWEED_COMPUTE_OP              operation name
@@ -93,6 +100,24 @@ or from the temporary file path:
 
 ```bash
 awk '{s += $1} END {print s}' "$1"
+```
+
+When started with `-volume.compute.input=stdin`, the script receives no input
+path argument and should read from stdin:
+
+```bash
+#!/bin/sh
+tr '[:lower:]' '[:upper:]'
+```
+
+In this mode:
+
+```text
+argv[1]                         empty
+stdin / fd 0                    needle data stream
+SEAWEED_COMPUTE_INPUT_MODE      stdin
+SEAWEED_COMPUTE_INPUT_FILE      empty
+SEAWEED_COMPUTE_INPUT_FD        0
 ```
 
 ## 4. Normal Request Examples
