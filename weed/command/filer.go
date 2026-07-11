@@ -54,6 +54,7 @@ type FilerOptions struct {
 	port                      *int
 	portGrpc                  *int
 	publicPort                *int
+	idleTimeout               *int
 	filerGroup                *string
 	collection                *string
 	defaultReplicaPlacement   *string
@@ -100,6 +101,7 @@ func init() {
 	f.port = cmdFiler.Flag.Int("port", 8888, "filer server http listen port")
 	f.portGrpc = cmdFiler.Flag.Int("port.grpc", 0, "filer server grpc listen port")
 	f.publicPort = cmdFiler.Flag.Int("port.readonly", 0, "readonly port opened to public")
+	f.idleTimeout = cmdFiler.Flag.Int("idleTimeout", 10, "connection idle seconds")
 	f.defaultReplicaPlacement = cmdFiler.Flag.String("defaultReplicaPlacement", "", "default replication type. If not specified, use master setting.")
 	f.disableDirListing = cmdFiler.Flag.Bool("disableDirListing", false, "turn off directory listing")
 	f.maxMB = cmdFiler.Flag.Int("maxMB", 4, "split files larger than the limit")
@@ -424,7 +426,7 @@ func (fo *FilerOptions) startFiler() {
 	glog.V(0).Infof("Start Seaweed Filer %s at %s:%d", version.Version(), *fo.ip, *fo.port)
 	filerListener, filerLocalListener, e := util.NewIpAndLocalListeners(
 		*fo.bindIp, *fo.port,
-		time.Duration(10)*time.Second,
+		time.Duration(*fo.idleTimeout)*time.Second,
 	)
 	if e != nil {
 		glog.Fatalf("Filer listener error: %v", e)
