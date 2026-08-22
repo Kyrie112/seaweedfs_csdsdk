@@ -424,7 +424,7 @@ func (fo *FilerOptions) startFiler() {
 	glog.V(0).Infof("Start Seaweed Filer %s at %s:%d", version.Version(), *fo.ip, *fo.port)
 	filerListener, filerLocalListener, e := util.NewIpAndLocalListeners(
 		*fo.bindIp, *fo.port,
-		time.Duration(10)*time.Second,
+		time.Duration(10)*time.Minute,
 	)
 	if e != nil {
 		glog.Fatalf("Filer listener error: %v", e)
