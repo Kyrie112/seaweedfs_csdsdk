@@ -36,17 +36,15 @@ volume 公共参数:
 -volume.compute.maxOutputMB=16
 ```
 
-### 2.3 源码修复(1 行)
+### 2.3 长计算请求的 filer 空闲超时(重要)
 
-原始 fork 的 filer HTTP 监听器带 **10 秒"无活动超时"**(`weed/command/filer.go:427`),计算下沉期间客户端无数据流动,>10s 的计算请求会被断开(现象:volume 日志 `signal: killed`)。修复:
+计算下沉期间客户端与 filer 之间没有数据流动,而 filer HTTP 监听器带 **10 秒"无活动超时"**,超过 10 秒的计算请求会被断开(volume 日志表现为 `signal: killed`)。本次部署曾以本地补丁把该超时提升到 10 分钟;上游随后已把该值改为可配置参数:
 
-```diff
--		time.Duration(10)*time.Second,
-+		time.Duration(10)*time.Minute,
+```bash
+weed filer ... -idleTimeout=600   # 连接空闲秒数,默认 10;长计算下沉请求需调大
 ```
 
-重新静态编译并分发后,大文件计算下沉从"10 秒被掐断"变为"17.6 秒正常返回"。
-
+调大后,176MB 大文件计算下沉从"10 秒被掐断"变为"17.6 秒正常返回"。
 ## 3. Sum.sh 验证
 
 三台机器直接执行 `/home/dess/compute_program/sum.sh`(输入 8 个数 3,10,17,24,31,38,45,52):
