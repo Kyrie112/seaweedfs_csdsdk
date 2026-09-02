@@ -574,6 +574,12 @@ func (s3a *S3ApiServer) GetObjectHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Object-storage compute trigger: a GET carrying a compute operation is
+	// routed to the unified filer compute API instead of streaming object data.
+	if s3a.handleObjectCompute(w, r, bucket, object) {
+		return
+	}
+
 	// Check for SOSAPI virtual objects (system.xml, capacity.xml)
 	// These are dynamically generated and don't exist on disk
 	if s3a.handleSOSAPIGetObject(w, r, bucket, object) {
