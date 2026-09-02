@@ -269,12 +269,14 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 				fs.StartTusSessionCleanup(1 * time.Hour)
 			}
 		}
+		defaultMux.HandleFunc(computeAPIBasePath, requestIDMiddleware(fs.multiProtocolComputeHandler))
 		defaultMux.HandleFunc("/", fs.filerGuard.WhiteList(requestIDMiddleware(fs.filerHandler)))
 	}
 	if defaultMux != readonlyMux {
 		handleStaticResources(readonlyMux)
 		readonlyMux.HandleFunc("/healthz", requestIDMiddleware(fs.filerHealthzHandler))
 		readonlyMux.HandleFunc("/readyz", requestIDMiddleware(fs.filerHealthzHandler))
+		readonlyMux.HandleFunc(computeAPIBasePath, requestIDMiddleware(fs.multiProtocolComputeHandler))
 		readonlyMux.HandleFunc("/", fs.filerGuard.WhiteList(requestIDMiddleware(fs.readonlyFilerHandler)))
 	}
 
