@@ -165,28 +165,27 @@ class OpenClRuntime {
     if (req.operation != "rawsum64" && req.operation != "file_sum64") {
       throw std::runtime_error("unsupported operation " + req.operation);
     }
-    const std::size_t word_count = static_cast<std::size_t>((req.size + 7) / 8);
-    if (word_count == 0) {
+    if (req.size == 0) {
       return "0";
     }
-    std::vector<uint64_t, aligned_allocator<uint64_t>> words(word_count, 0);
+    const std::size_t byte_count = static_cast<std::size_t>(req.size);
+    std::vector<unsigned char, aligned_allocator<unsigned char>> bytes(byte_count, 0);
 
     const int fd = ::open(req.data_file.c_str(), O_RDONLY);
     if (fd < 0) {
       throw std::runtime_error("cannot open data file " + req.data_file);
     }
-    const ssize_t got = ::pread(fd, words.data(), static_cast<std::size_t>(req.size),
+    const ssize_t got = ::pread(fd, bytes.data(), byte_count,
                                 static_cast<off_t>(req.offset));
     ::close(fd);
     if (got < 0) {
       throw std::runtime_error("cannot read data range " + req.data_file);
     }
-    // words were pre-zeroed; partial tail is treated as zero-padded.
+    // The kernel packs every 8 bytes itself; the final partial word is padded.
 
     cl_int err = CL_SUCCESS;
-    const std::size_t input_bytes = word_count * sizeof(uint64_t);
     cl::Buffer input(*context_, CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
-                     input_bytes, words.data(), &err);
+                     byte_count, bytes.data(), &err);
     if (err != CL_SUCCESS) throw std::runtime_error("create input buffer failed");
     uint64_t result = 0;
     cl::Buffer output(*context_, CL_MEM_WRITE_ONLY | CL_MEM_USE_HOST_PTR,
@@ -197,7 +196,7 @@ class OpenClRuntime {
     if (err != CL_SUCCESS) throw std::runtime_error("create kernel failed");
     unsigned arg = 0;
     OCL_CHECK(err, err = kernel.setArg(arg++, input));
-    OCL_CHECK(err, err = kernel.setArg(arg++, static_cast<uint32_t>(word_count)));
+    OCL_CHECK(err, err = kernel.setArg(arg++, static_cast<uint32_t>(byte_count)));
     OCL_CHECK(err, err = kernel.setArg(arg++, output));
     OCL_CHECK(err, err = queue_->enqueueMigrateMemObjects({input}, 0));
     OCL_CHECK(err, err = queue_->enqueueTask(kernel));
