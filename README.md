@@ -62,3 +62,42 @@ SeaweedFS volume 侧:
 - 当前实现把数据区间 `pread` 到 FPGA buffer(无临时文件);
   后续可升级为 XRT P2P buffer / NVMe 直读;
 - 设备端支持 `rawsum64` / `file_sum64` 同一求和内核。
+
+## .9(SmartSSD 实机)编译与验证记录
+
+执行位置:`192.168.0.9`,XRT 2.14.354,Vitis 2022.2,设备 `xilinx_u2_gen3x4_xdma_gc_2_202110_1`。
+
+1. 安装缺失的 OpenCL C++ 头文件:`apt-get install opencl-clhpp-headers opencl-headers`
+2. 安装 Vitis 平台包:
+   `/home/dess/workspace/dess_smartssd_setups/Xilinx/xilinx-u2-gen3x4-xdma-gc-2-202110-1-dev_1-3311104_all.deb`
+3. 编译 host agent:
+
+   ```bash
+   cd smartssd_compute_module
+   source /opt/xilinx/xrt/setup.sh
+   make
+   # build/csd_agent
+   ```
+
+4. 编译 file_sum64 内核并用 v++ 硬件链接生成 xclbin(约 2 小时):
+
+   ```bash
+   /home/dess/workspace/dess_smartssd_setups/Vitis/2022.2/bin/v++ \\
+     -t hw --platform /opt/xilinx/platforms/xilinx_u2_gen3x4_xdma_gc_2_202110_1/xilinx_u2_gen3x4_xdma_gc_2_202110_1.xpfm \\
+     -c -k file_sum64 --temp_dir _x.hw -o _x.hw/file_sum64.xo src/file_sum64_kernel.cpp
+   /home/dess/workspace/dess_smartssd_setups/Vitis/2022.2/bin/v++ \\
+     -t hw --platform <同上> --link --temp_dir _x.hw \\
+     -o _x.hw/file_sum64.link.xclbin _x.hw/file_sum64.xo
+   cp _x.hw/file_sum64.link.xclbin file_sum64.xclbin
+   ```
+
+5. 真实设备功能验证:
+
+   ```bash
+   ./build/csd_agent --xclbin=file_sum64.xclbin --listen=127.0.0.1:18090 &
+   curl -s -X POST -H 'Content-Type: application/json' -d @request.json \
+     http://127.0.0.1:18090/v1/compute
+   ```
+
+   测试数据:8 个 little-endian uint64 `[3,10,17,24,31,38,45,52]`,
+   期望 `220`,实际 agent 返回 `220`;非零 offset 场景同样返回 `220`。
