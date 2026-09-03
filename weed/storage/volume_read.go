@@ -17,6 +17,71 @@ import (
 
 const PagedReadLimit = 1024 * 1024
 
+// NeedleComputeRegion describes the exact payload range inside a volume data
+// file that a CSD/near-storage compute engine should scan. SeaweedFS only
+// reads the needle metadata (never the payload) to build this descriptor.
+type NeedleComputeRegion struct {
+	DataFile   string
+	DataOffset int64
+	DataSize   int64
+	Cookie     Cookie
+}
+
+// NeedleComputeRegion resolves the payload range for needle n without reading
+// the payload into memory. It returns supported=false for cases the CSD path
+// must not serve (missing/deleted needle, legacy version, compression or
+// chunked manifest) so callers can fall back to the existing script path.
+func (v *Volume) NeedleComputeRegion(n *needle.Needle) (region NeedleComputeRegion, supported bool, err error) {
+	if n == nil {
+		return region, false, nil
+	}
+	v.dataFileAccessLock.RLock()
+	defer v.dataFileAccessLock.RUnlock()
+
+	if v.nm == nil {
+		return region, false, ErrorNotFound
+	}
+	nv, ok := v.nm.Get(n.Id)
+	if !ok || nv.Offset.IsZero() {
+		return region, false, ErrorNotFound
+	}
+	readSize := nv.Size
+	if readSize.IsDeleted() {
+		return region, false, ErrorDeleted
+	}
+	if readSize == 0 {
+		return region, false, nil
+	}
+	if v.Version() < needle.Version2 {
+		// The on-disk layout predates the v2 DataSize field; keep the CPU path.
+		return region, false, fmt.Errorf("csd unsupported: legacy volume version %d", v.Version())
+	}
+
+	actualOffset := nv.Offset.ToActualOffset()
+	if err := n.ReadNeedleMeta(v.DataBackend, actualOffset, readSize, v.Version()); err != nil {
+		if err == needle.ErrorSizeMismatch && OffsetSize == 4 {
+			if err = n.ReadNeedleMeta(v.DataBackend, actualOffset+int64(MaxPossibleVolumeSize), readSize, v.Version()); err != nil {
+				return region, false, err
+			}
+		} else {
+			return region, false, err
+		}
+	}
+	if n.IsCompressed() {
+		return region, false, fmt.Errorf("csd unsupported: needle %d compressed", n.Id)
+	}
+	if n.IsChunkedManifest() {
+		return region, false, fmt.Errorf("csd unsupported: needle %d chunked manifest", n.Id)
+	}
+	region = NeedleComputeRegion{
+		DataFile:   v.DataBackend.Name(),
+		DataOffset: actualOffset + NeedleHeaderSize + DataSizeSize,
+		DataSize:   int64(n.DataSize),
+		Cookie:     n.Cookie,
+	}
+	return region, true, nil
+}
+
 // read fills in Needle content by looking up n.Id from NeedleMapper
 func (v *Volume) readNeedle(n *needle.Needle, readOption *ReadOption, onReadSizeFn func(size Size)) (count int, err error) {
 	v.dataFileAccessLock.RLock()

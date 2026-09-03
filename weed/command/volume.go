@@ -79,6 +79,9 @@ type VolumeServerOptions struct {
 	computeScriptDir              *string
 	computeTimeout                *time.Duration
 	computeMaxOutputMB            *int
+	computeCSDEnabled             *bool
+	computeCSDEndpoint            *string
+	computeCSDTimeout             *time.Duration
 	debug                         *bool
 	debugPort                     *int
 	diskIOProbe                   *bool
@@ -236,6 +239,9 @@ func init() {
 	v.computeScriptDir = cmdVolume.Flag.String("volume.compute.dir", "", "directory containing volume compute scripts")
 	v.computeTimeout = cmdVolume.Flag.Duration("volume.compute.timeout", 30*time.Second, "timeout for each volume compute script execution")
 	v.computeMaxOutputMB = cmdVolume.Flag.Int("volume.compute.maxOutputMB", 64, "maximum stdout size in MB for each volume compute script")
+	v.computeCSDEnabled = cmdVolume.Flag.Bool("volume.compute.csd.enabled", false, "enable native CSD/near-storage compute through a compute agent")
+	v.computeCSDEndpoint = cmdVolume.Flag.String("volume.compute.csd.endpoint", "", "CSD compute agent base URL, e.g. http://127.0.0.1:18090")
+	v.computeCSDTimeout = cmdVolume.Flag.Duration("volume.compute.csd.timeout", 60*time.Second, "timeout for each CSD compute request")
 	v.debug = cmdVolume.Flag.Bool("debug", false, "serves runtime profiling data via pprof on the port specified by -debug.port")
 	v.debugPort = cmdVolume.Flag.Int("debug.port", 6060, "http port for debugging")
 	v.setDiskIOProbeDefaults()
@@ -453,6 +459,18 @@ func (v VolumeServerOptions) startVolumeServer(volumeFolders, maxVolumeCounts, v
 	if v.computeMaxOutputMB != nil {
 		computeMaxOutputMB = *v.computeMaxOutputMB
 	}
+	computeCSDEnabled := false
+	if v.computeCSDEnabled != nil {
+		computeCSDEnabled = *v.computeCSDEnabled
+	}
+	computeCSDEndpoint := ""
+	if v.computeCSDEndpoint != nil {
+		computeCSDEndpoint = *v.computeCSDEndpoint
+	}
+	computeCSDTimeout := 60 * time.Second
+	if v.computeCSDTimeout != nil {
+		computeCSDTimeout = *v.computeCSDTimeout
+	}
 	volumeServer := weed_server.NewVolumeServer(volumeMux, publicVolumeMux,
 		*v.ip, *v.port, *v.portGrpc, *v.publicUrl, volumeServerId,
 		v.folders, v.folderMaxLimits, minFreeSpaces, diskTypes, folderTags,
@@ -477,6 +495,9 @@ func (v VolumeServerOptions) startVolumeServer(volumeFolders, maxVolumeCounts, v
 			ScriptDir:   computeScriptDir,
 			Timeout:     computeTimeout,
 			MaxOutputMB: computeMaxOutputMB,
+			CSDEnabled:  computeCSDEnabled,
+			CSDEndpoint: computeCSDEndpoint,
+			CSDTimeout:  computeCSDTimeout,
 		},
 		diskProbeConfig,
 	)

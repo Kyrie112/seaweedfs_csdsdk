@@ -176,6 +176,16 @@ func (vs *VolumeServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request)
 	}
 	cookie := n.Cookie
 
+	// CSD native compute path: resolve the needle payload range from metadata
+	// and let the SmartSSD/CSD engine read it near-storage. This avoids reading
+	// the whole needle into host memory and creating a temporary file. Any
+	// unsupported/failed case falls through to the script-based compute path.
+	if operation := r.URL.Query().Get(volumeComputeQuery); operation != "" && hasVolume && vs.csdSupported() {
+		if vs.tryHandleCSDCompute(w, r, volumeId, n, cookie, operation, filename) {
+			return
+		}
+	}
+
 	readOption := &storage.ReadOption{
 		ReadDeleted:    r.FormValue("readDeleted") == "true",
 		HasSlowRead:    vs.hasSlowRead,

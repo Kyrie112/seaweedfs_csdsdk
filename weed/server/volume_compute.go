@@ -23,6 +23,14 @@ type VolumeComputeConfig struct {
 	ScriptDir   string
 	Timeout     time.Duration
 	MaxOutputMB int
+
+	// CSDEnabled turns on the native near-storage compute path. When enabled,
+	// compute requests for supported needles are sent to CSDEndpoint as
+	// {data_file, offset, size, operation} instead of being read into memory
+	// and executed through a temporary-file script.
+	CSDEnabled  bool
+	CSDEndpoint string
+	CSDTimeout  time.Duration
 }
 
 const volumeComputeQuery = "compute"
