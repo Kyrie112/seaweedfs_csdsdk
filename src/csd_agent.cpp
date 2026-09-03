@@ -138,9 +138,26 @@ class OpenClRuntime {
     if (err != CL_SUCCESS) throw std::runtime_error("create command queue failed");
 
     const std::string blob = read_binary_file(xclbin_path);
-    cl::Program::Binaries bins{{blob.data(), blob.size()}};
-    program_ = std::make_unique<cl::Program>(*context_, {device_}, bins, nullptr, &err);
-    if (err != CL_SUCCESS) throw std::runtime_error("load program failed");
+    const cl_device_id dev_id = device_();
+    const unsigned char* image = reinterpret_cast<const unsigned char*>(blob.data());
+    const size_t image_len = blob.size();
+    cl_int binary_status = CL_SUCCESS;
+    cl_program raw = ::clCreateProgramWithBinary(
+        (*context_)(), 1, &dev_id, &image_len, &image, &binary_status, &err);
+    if (err != CL_SUCCESS || raw == nullptr) {
+      throw std::runtime_error("create program from binary failed");
+    }
+    err = ::clBuildProgram(raw, 1, &dev_id, "", nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+      size_t log_len = 0;
+      ::clGetProgramBuildInfo(raw, dev_id, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_len);
+      std::string log(log_len > 0 ? log_len : 1, '\0');
+      if (log_len > 0) {
+        ::clGetProgramBuildInfo(raw, dev_id, CL_PROGRAM_BUILD_LOG, log_len, &log[0], nullptr);
+      }
+      throw std::runtime_error("build program failed: " + log);
+    }
+    program_ = std::make_unique<cl::Program>(raw, false);
   }
 
   // Returns decimal result string.
