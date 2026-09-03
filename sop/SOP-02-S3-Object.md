@@ -19,25 +19,75 @@
 - S3 网关已启动(内嵌 filer `-s3`,或独立 `weed s3`);
 - 调用方具备该对象的读权限。
 
-## 4. 准备数据
+## 4. 对象 CRUD(增删改查)
 
 ```bash
 S3=<s3-url>
+```
+
+### 4.1 增(Create)
+
+```bash
+# 创建 bucket
 aws --endpoint-url "$S3" s3api create-bucket --bucket <bucket-name>
+
+# 上传对象
 aws --endpoint-url "$S3" s3 cp <local-file> s3://<bucket-name>/<object-key>
 ```
 
-大对象由 `aws s3 cp` 自动分段上传;filer 负责将对象切分为多个 chunk。
+大对象由 `aws s3 cp` 自动分段上传。
 
-## 5. 普通对象操作参考
+### 4.2 删(Delete)
 
-| 操作 | 命令 |
-| --- | --- |
-| 读取 | `aws --endpoint-url "$S3" s3api get-object --bucket <bucket-name> --key <object-key> <output-file>` |
-| 覆盖 | `aws --endpoint-url "$S3" s3 cp <new-local-file> s3://<bucket-name>/<object-key>` |
-| 删除 | `aws --endpoint-url "$S3" s3 rm s3://<bucket-name>/<object-key>` |
+```bash
+# 删除对象
+aws --endpoint-url "$S3" s3 rm s3://<bucket-name>/<object-key>
 
-## 6. 计算调用
+# 删除空 bucket
+aws --endpoint-url "$S3" s3api delete-bucket --bucket <bucket-name>
+```
+
+### 4.3 改(Update)
+
+对象存储“修改”通常为整对象覆盖或复制:
+
+```bash
+# 覆盖原对象
+aws --endpoint-url "$S3" s3 cp <new-local-file> s3://<bucket-name>/<object-key>
+
+# 复制为新对象
+aws --endpoint-url "$S3" s3 cp s3://<bucket-name>/<object-key> s3://<bucket-name>/<new-object-key>
+```
+
+### 4.4 查(Read/Query)
+
+```bash
+# 读取对象
+aws --endpoint-url "$S3" s3api get-object \
+  --bucket <bucket-name> --key <object-key> <output-file>
+
+# 读取对象元数据(HEAD)
+aws --endpoint-url "$S3" s3api head-object \
+  --bucket <bucket-name> --key <object-key>
+
+# 列出对象
+aws --endpoint-url "$S3" s3 ls s3://<bucket-name>/
+
+# 按前缀列出对象
+aws --endpoint-url "$S3" s3 ls s3://<bucket-name>/<prefix>/
+```
+
+未配置凭证时可使用 curl:
+
+```bash
+# 匿名读
+curl "$S3/<bucket-name>/<object-key>" -o <output-file>
+
+# 匿名删除
+curl -X DELETE "$S3/<bucket-name>/<object-key>"
+```
+
+## 5. 计算调用
 
 ### 方式 A:S3 查询参数 `?x-compute=`
 
@@ -68,7 +118,7 @@ FILER=<filer-url>
 curl -s "$FILER/api/compute/object/<bucket-name>/<object-key>?compute=<operation>"
 ```
 
-## 7. 结果验证
+## 6. 结果验证
 
 - 成功响应为 HTTP 200,body 为算子结果;
 - 与独立计算的 `<expected-result>` 比较;
@@ -78,7 +128,7 @@ curl -s "$FILER/api/compute/object/<bucket-name>/<object-key>?compute=<operation
   compute "<operation>" across <chunk-count> chunks of <object-key>
   ```
 
-## 8. 错误处理
+## 7. 错误处理
 
 | 现象 | 可能原因 | 处理 |
 | --- | --- | --- |
@@ -87,7 +137,7 @@ curl -s "$FILER/api/compute/object/<bucket-name>/<object-key>?compute=<operation
 | 内部错误 | filer/volume 计算失败 | 查看 filer 与 volume 日志 |
 | 标准 SDK 无法传参 | `x-compute` 是自定义扩展参数 | 改用 curl/预签名/自定义客户端 |
 
-## 9. 注意
+## 8. 注意
 
 - 普通 `GET Object` 仍返回对象数据,不会触发计算;
 - 计算触发后返回算子结果而非对象数据;

@@ -20,31 +20,53 @@
 
 见 [README.md](README.md) 通用前置条件。
 
-## 4. 准备块卷
+## 4. 块卷 CRUD(增删改查)
 
-上传原始块镜像:
+设:
 
 ```bash
 FILER=<filer-url>
+```
+
+### 4.1 增(Create)
+
+```bash
 curl -F file=@<local-file> "$FILER/blocks/<block-volume-name>"
 ```
 
-确认块镜像与 chunk 情况:
+### 4.2 删(Delete)
 
 ```bash
-curl "$FILER/blocks/<block-volume-name>?metadata=true&resolveManifest=true"
+curl -X DELETE "$FILER/blocks/<block-volume-name>"
 ```
 
-## 5. 普通块操作参考
+### 4.3 改(Update)
 
-| 操作 | 命令 |
-| --- | --- |
-| 整卷读取 | `curl "$FILER/blocks/<block-volume-name>" -o <output-file>` |
-| 区间读取 | `curl -H 'Range: bytes=<start>-<end>' "$FILER/blocks/<block-volume-name>" -o <output-file>` |
-| 整卷覆盖 | `curl -F file=@<new-local-file> "$FILER/blocks/<block-volume-name>"` |
-| 删除 | `curl -X DELETE "$FILER/blocks/<block-volume-name>"` |
+当前 HTTP 原型以整块覆盖为主:
 
-## 6. 计算调用
+```bash
+curl -F file=@<new-local-file> "$FILER/blocks/<block-volume-name>"
+```
+
+块级随机写、iSCSI/NVMe 协议读写属于后续数据面工作。
+
+### 4.4 查(Read/Query)
+
+```bash
+# 整卷读取
+curl "$FILER/blocks/<block-volume-name>" -o <output-file>
+
+# 按字节区间读取(模拟块读)
+curl -H 'Range: bytes=<start>-<end>' "$FILER/blocks/<block-volume-name>" -o <output-file>
+
+# 查看元数据与 chunk
+curl "$FILER/blocks/<block-volume-name>?metadata=true&resolveManifest=true"
+
+# 列出块镜像目录
+curl -H 'Accept: application/json' "$FILER/blocks/"
+```
+
+## 5. 计算调用
 
 ### 方式 A:默认块镜像目录映射
 
@@ -61,13 +83,13 @@ curl -s \
   "$FILER/api/compute/block/<volume-alias>?compute=<operation>&path=/blocks/<block-volume-name>"
 ```
 
-## 7. 结果验证
+## 6. 结果验证
 
 - 成功响应为 HTTP 200,body 为算子结果;
 - 与独立计算的 `<expected-result>` 比较;
 - 对多 chunk 块镜像,filer 日志应显示跨 chunk 执行。
 
-## 8. 错误处理
+## 7. 错误处理
 
 | 现象 | 可能原因 | 处理 |
 | --- | --- | --- |
@@ -76,7 +98,7 @@ curl -s \
 | HTTP 403 | volume 未开启计算 | 检查计算开关 |
 | HTTP 500 | 脚本执行失败 | 查看 volume 日志 |
 
-## 9. 注意
+## 8. 注意
 
 - 当前为逻辑块卷模型,尚未实现真实 iSCSI/NVMe 协议;
 - 块卷的普通读/写仍是文件语义,计算是独立调用入口。
