@@ -15,6 +15,30 @@
 
 主机只发起读请求,不再持有整段数据。
 
+### 2.1 逐步数据流动(目标)
+
+1. SeaweedFS 只下发 `.dat` 路径、offset、size;
+2. agent 用 XRT P2P buffer(`XCL_MEM_EXT_P2P_BUFFER`);
+3. `enqueueMapBuffer` 返回 FPGA device memory 对应的主机可访问指针;
+4. `pread` 直接写入该 P2P 指针,数据由 DMA 进入 FPGA DDR;
+5. 内核直接读取 P2P 区域计算;
+6. 仅结果返回主机。
+
+### 2.2 待消除的缺陷
+
+| 缺陷 | V2 现状 | V3 目标 |
+| --- | --- | --- |
+| host 侧等大缓冲区 | 存在 | 消除 |
+| host→FPGA 二次迁移 | 存在 | 由 pread DMA 直通替代 |
+| unaligned extra memcpy | 真机日志已出现 | 使用 XRT P2P 缓冲区避免 |
+| O_DIRECT/页对齐 | 未处理 | 与 NVMe 对齐配合 |
+
+### 2.3 仍保留的限制
+
+- P2P 仍是“盘数据通过 PCIe DMA 进入 FPGA”,不是设备内部直读;
+- 若 volume `.dat` 不在 SmartSSD 本地,仍需网络传输;
+- 完全不出盘需要设备固件/厂商 NVMe 命令支持,属于后续版本。
+
 ## 3. 设计要点
 
 - 使用 `cl_mem_ext_ptr_t` + `XCL_MEM_EXT_P2P_BUFFER`;

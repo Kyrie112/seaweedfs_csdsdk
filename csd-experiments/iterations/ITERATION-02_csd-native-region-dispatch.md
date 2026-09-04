@@ -108,6 +108,60 @@ filer 汇总各 chunk 结果
 - SeaweedFS ↔ CSD agent 协议已分别验证;
 - 尚未在 .9 上把 SeaweedFS 新分支与真实 agent 做端到端联调。
 
+### 7.4 数据流动逐步拆解
+
+SeaweedFS 侧(已消除全量读取):
+
+```text
+用户 ?compute=
+  → filer 解析 chunk 清单
+  → volume 只读元数据定位 {.dat, offset, size}
+  → POST /v1/compute
+  → 等小数结果
+```
+
+CSD agent 侧(仍有一次主要数据搬运):
+
+```text
+磁盘 .dat
+  → open()(未使用 O_DIRECT)
+  → pread:磁盘 → OS page cache → host CL buffer
+  → XRT enqueueMigrateMemObjects:host buffer → FPGA device memory
+  → file_sum64 内核 AXI 读 device memory
+  → 8B 结果返回
+```
+
+当前实测中 XRT 还会打印:
+
+```text
+[XRT] WARNING: unaligned host pointer detected, this leads to extra memcpy
+```
+
+说明 host 指针未满足 XRT 的固定/对齐要求时,还会先复制到内部对齐缓冲区。
+
+### 7.5 缺陷分析
+
+| # | 缺陷 | 位置 | 影响 |
+| --- | --- | --- | --- |
+| 1 | agent 仍需要一块与 chunk 等大的主机内存 | `pread` 目标 | 主机内存开销仍随 chunk 大小增长 |
+| 2 | 数据经过 page cache | 普通文件 `open/pread` | 多一层内核缓冲拷贝,缺少 O_DIRECT |
+| 3 | host→FPGA 迁移 | XRT migrate | 一次 PCIe 数据流 |
+| 4 | host 指针未对齐触发额外 memcpy | CL buffer | 真机日志已确认 |
+| 5 | 数据需先到 host 再进 FPGA | 当前架构 | 未实现盘直通/P2P |
+| 6 | volume `.dat` 未验证放在 SmartSSD 本地 NVMe | 部署前提 | 若跨网络,则仍有网络传输 |
+| 7 | 两段未完整端到端联调 | 集成 | 协议已对齐但未在同机验证 |
+
+### 7.6 相比 V0/V1 的改进与剩余问题
+
+| 对比项 | V0/V1 | V2 |
+| --- | --- | --- |
+| 临时文件 | 有 | 无 |
+| SeaweedFS 整段读入 `n.Data` | 有 | 无(只读元数据) |
+| 计算位置 | CPU 脚本 | SmartSSD FPGA |
+| 数据路径 | 盘→内存→临时文件→CPU | 盘→host CL buffer→FPGA→内核 |
+| 主机内存占用 | 与 chunk 等大 | 仍与 chunk 等大(在 agent 进程) |
+| 盘直通 | 无 | 无(下一步 P2P) |
+
 ## 8. 当前数据流与局限
 
 ```text
