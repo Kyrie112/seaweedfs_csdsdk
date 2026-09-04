@@ -1,63 +1,86 @@
-# V3:P2P / 盘直通 FPGA(规划模板)
-
-> 本文件为下一迭代模板,当前尚未实现。开始 V3 后按本结构补写详细内容。
+# V3:P2P / 盘直通 FPGA
 
 ## 1. 目的
 
-消除 V2 中“host CL buffer + XRT migrate”的主机内存中转,让数据从
-盘上 `.dat` 直接 DMA 到 FPGA device memory,再进入计算内核。
+在 V2 agent 基础上消除“host CL buffer + XRT migrate”的主机内存中转,
+让 `.dat` 区间通过 XRT P2P 映射直接写入 SmartSSD FPGA 的 device memory。
 
-## 2. 目标数据路径
+## 2. 时间与分支
+
+- 时间:2026-09-04
+- CSD 模块分支:`feat/csd-native-compute`
+  - 提交:`938de41 feat: P2P pread straight into FPGA memory via XCL_MEM_EXT_P2P_BUFFER`
+- SeaweedFS 侧协议不变,仍为 `POST /v1/compute {operation,data_file,offset,size}`。
+
+## 3. 数据路径
 
 ```text
-.dat → pread 到 FPGA P2P buffer → file_sum64 内核 → 结果
+磁盘 .dat 区间
+   ↓ O_DIRECT + pread 到 P2P 映射指针
+FPGA device memory(XCL_MEM_EXT_P2P_BUFFER)
+   ↓ file_sum64 内核直接读
+8B 结果返回
 ```
 
-主机只发起读请求,不再持有整段数据。
+V2 与 V3 对比:
 
-### 2.1 逐步数据流动(目标)
+```text
+V2: .dat → host CL buffer → XRT migrate → FPGA DDR → kernel
+V3: .dat → O_DIRECT/P2P → FPGA DDR → kernel
+```
 
-1. SeaweedFS 只下发 `.dat` 路径、offset、size;
-2. agent 用 XRT P2P buffer(`XCL_MEM_EXT_P2P_BUFFER`);
-3. `enqueueMapBuffer` 返回 FPGA device memory 对应的主机可访问指针;
-4. `pread` 直接写入该 P2P 指针,数据由 DMA 进入 FPGA DDR;
-5. 内核直接读取 P2P 区域计算;
-6. 仅结果返回主机。
+## 4. 实现要点
 
-### 2.2 待消除的缺陷
+- 使用 `cl_mem_ext_ptr_t + XCL_MEM_EXT_P2P_BUFFER` 创建输入 buffer;
+- `queue_->enqueueMapBuffer` 返回 FPGA device memory 在主机地址空间中的映射;
+- `pread` 直接把盘上区间写入映射指针;
+- offset 与 size 均满足 512B 对齐时启用 `O_DIRECT`,实现盘 → FPGA 的直读;
+- 输出 buffer 改为对齐分配,消除 V2 中的 `unaligned host pointer` 警告。
 
-| 缺陷 | V2 现状 | V3 目标 |
+## 5. 真机验证(.9)
+
+### 5.1 小请求(非 512 对齐)
+
+数据 `[3,10,17,24,31,38,45,52]`,期望 220:
+
+| offset | size | 结果 |
 | --- | --- | --- |
-| host 侧等大缓冲区 | 存在 | 消除 |
-| host→FPGA 二次迁移 | 存在 | 由 pread DMA 直通替代 |
-| unaligned extra memcpy | 真机日志已出现 | 使用 XRT P2P 缓冲区避免 |
-| O_DIRECT/页对齐 | 未处理 | 与 NVMe 对齐配合 |
+| 0 | 64 | 54(对应文件前 64B 内容,正确) |
+| 32 | 64 | 220 ✓ |
 
-### 2.3 仍保留的限制
+### 5.2 O_DIRECT + P2P(512B 对齐)
 
-- P2P 仍是“盘数据通过 PCIe DMA 进入 FPGA”,不是设备内部直读;
-- 若 volume `.dat` 不在 SmartSSD 本地,仍需网络传输;
-- 完全不出盘需要设备固件/厂商 NVMe 命令支持,属于后续版本。
+数据为 `[3,10,17,24,31,38,45,52] × 8`,512B,期望 1760:
 
-## 3. 设计要点
+```text
+offset=0, size=512 → {"result":"1760"} ✓
+```
 
-- 使用 `cl_mem_ext_ptr_t` + `XCL_MEM_EXT_P2P_BUFFER`;
-- `enqueueMapBuffer` 取得可直接 `pread` 的设备内存指针;
-- 数据文件路径与对齐要求与 SmartSSD NVMe 对齐(如 512B/4K);
-- 大区间分片、并发与错误处理。
+两次验证均未再出现:
 
-## 4. 验证指标(填写)
+```text
+[XRT] WARNING: unaligned host pointer detected, this leads to extra memcpy
+```
 
-| 指标 | 期望 | 实测 |
+## 6. 相比 V2 消除的缺陷
+
+| 缺陷 | V2 | V3 |
 | --- | --- | --- |
-| 是否还有 host memcpy | 否 | 待测 |
-| pread 吞吐 | 接近 NVMe 直通 | 待测 |
-| 端到端相对 V0 提升 | 待测 | 待测 |
+| host 侧等大 CL buffer | 存在 | 消除 |
+| XRT enqueueMigrateMemObjects | 存在 | 消除 |
+| unaligned extra memcpy | 真机日志出现 | 真机验证未出现 |
+| O_DIRECT/512B 对齐直读 | 未启用 | 对齐时启用 |
 
-## 5. 待补内容
+## 7. 当前限制
 
-- 代码位置
-- 编译产物
-- 真机验证记录
-- 当前限制
-- 论文价值
+- P2P/O_DIRECT 只适用于数据 offset 与 size 满足底层存储对齐的场景;
+- SeaweedFS `.dat` 中 needle 数据偏移通常不是 512B 对齐,直接 O_DIRECT 读单 chunk
+  需要解决区间对齐(如扇区对齐读 + 内核偏移参数);
+- 尚未把 P2P agent 与 SeaweedFS `.dat` 完整端到端联调;
+- 该实现仍通过 PCIe 将数据送入 FPGA,不是设备固件内部直读 NVMe。
+
+## 8. 论文价值
+
+- 证明“盘 → FPGA device memory”的 P2P 通路在 SmartSSD 上可行;
+- 消除 agent 侧主机缓冲与迁移,进一步逼近近存计算;
+- 为 SeaweedFS needle 对齐改造和最终 NVMe 直读版本提供硬件层基础。
