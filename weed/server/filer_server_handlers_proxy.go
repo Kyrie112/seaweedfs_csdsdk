@@ -215,7 +215,15 @@ func (fs *FilerServer) fetchChunkComputeResult(ctx context.Context, r *http.Requ
 	if len(urlStrings) == 0 {
 		return nil, fmt.Errorf("no volume server for compute target %s", fileId)
 	}
-	target, err := url.Parse(urlStrings[rand.IntN(len(urlStrings))])
+	// CSD-aware replica selection: probe /compute/status on each replica and
+	// prefer CSD-capable servers, then lower probe latency. If no replica is
+	// CSD-capable (or the status endpoint is absent), ranking degrades to
+	// latency/lexicographic order and the regular volume compute path is used.
+	ranked := fs.rankComputeReplicas(ctx, urlStrings)
+	if len(ranked) == 0 {
+		return nil, fmt.Errorf("no rankable volume server for compute target %s", fileId)
+	}
+	target, err := url.Parse(ranked[0])
 	if err != nil {
 		return nil, err
 	}

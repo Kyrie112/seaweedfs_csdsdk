@@ -145,6 +145,7 @@ func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 	adminMux.HandleFunc("/status", requestIDMiddleware(vs.statusHandler))
 	adminMux.HandleFunc("/healthz", requestIDMiddleware(vs.healthzHandler))
 	adminMux.HandleFunc("/readyz", requestIDMiddleware(vs.healthzHandler))
+	adminMux.HandleFunc("/compute/status", requestIDMiddleware(vs.csdStatusHandler))
 	if signingKey == "" || enableUiAccess {
 		// only expose the volume server details for safe environments
 		adminMux.HandleFunc("/ui/index.html", requestIDMiddleware(vs.uiStatusHandler))
@@ -158,6 +159,7 @@ func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 	if publicMux != adminMux {
 		// separated admin and public port
 		handleStaticResources(publicMux)
+		publicMux.HandleFunc("/compute/status", requestIDMiddleware(vs.csdStatusHandler))
 		publicMux.HandleFunc("/", requestIDMiddleware(vs.publicReadOnlyHandler))
 	}
 
