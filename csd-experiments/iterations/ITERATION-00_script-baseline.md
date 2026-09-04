@@ -22,6 +22,29 @@ Shell 脚本对单个 chunk 计算。该版本用于明确后续 CSD 改造要�
    ↓ 返回结果
 ```
 
+### 3.1 逐步数据流动
+
+1. volume 根据 needle map 找到 `.dat` 内的物理位置;
+2. `ReadNeedleData` 从磁盘读入 `n.Data`,实际经过
+   “磁盘 → 操作系统 page cache → 主机内存 `n.Data`”;
+3. 若 needle 为压缩存储,`maybeHandleComputeOperation` 先解压,产生第二次全量拷贝;
+4. `createComputeInputFile` 把 `n.Data` 写入临时文件(第三次全量写入);
+5. 算子脚本启动,读取临时文件并按行/字节解析;
+6. 脚本 stdout 收集到 `bytes.Buffer`,再作为 HTTP body 返回。
+
+### 3.2 缺陷分析
+
+| 缺陷 | 说明 | 影响 |
+| --- | --- | --- |
+| 全量磁盘读入主机内存 | `ReadVolumeNeedle` 先读整段 chunk | 主机内存与磁盘读流量随 chunk 大小线性增长 |
+| 临时文件写入/读取 | 每次计算都落盘再读 | 额外磁盘 I/O 与延迟 |
+| 主机 CPU 解析 | awk/perl 等逐行处理 | CPU 成为瓶颈,带宽受限时更明显 |
+| 脚本进程开销 | 每个请求 exec 一次脚本 | 启动与上下文切换开销 |
+| 压缩数据需主机解压 | 先全量读压缩数据,再解压成明文 | 多一次全量内存拷贝与 CPU 解压 |
+| 早期仅单 chunk | filer 只支持单 chunk 覆盖整个文件 | 大文件无法直接计算 |
+
+这些缺陷构成论文中“计算下沉到 CSD”的动机基线。
+
 ## 4. 代码位置
 
 - 读请求入口:`weed/server/volume_server_handlers_read.go`
@@ -37,6 +60,8 @@ Shell 脚本对单个 chunk 计算。该版本用于明确后续 CSD 改造要�
 2. 再从内存写入临时文件(第二次全量拷贝);
 3. 脚本启动、解释执行并按行解析数据;
 4. 大文件原本只能单 chunk 处理,超过 `-maxMB` 后无法直接计算。
+
+（更细的逐步数据流与缺陷见上文 3.1/3.2。）
 
 ## 6. 验证结果(实验报告)
 
