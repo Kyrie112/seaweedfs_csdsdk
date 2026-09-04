@@ -79,12 +79,12 @@ CPU 配额下并发不可用)即为后续 CSD 部署的基线证据。
 
 ```bash
 # 实验 A(带宽):见 REPORT_SERVER.md
-./run_server_experiments.sh all results_server.csv 3
+../scripts/run_server_experiments.sh all ../results/results_server.csv 3
 
 # 实验 B(CPU 配额 × 并发)
-./run_server_cpu_quota.sh all results_server_cpu_quota.csv
+../scripts/run_server_cpu_quota.sh all ../results/results_server_cpu_quota.csv
 ```
 
-- 脚本:`run_server_experiments.sh`、`run_server_cpu_quota.sh`
-- 数据:`results_server.csv`、`results_server_cpu_quota.csv`
-- 分析:`analyze_server.py`、`final_server_stats.py`
+- 脚本:`../scripts/run_server_experiments.sh`、`../scripts/run_server_cpu_quota.sh`
+- 数据:`../results/results_server.csv`、`../results/results_server_cpu_quota.csv`
+- 分析:`../scripts/analyze_server.py`、`../scripts/final_server_stats.py`

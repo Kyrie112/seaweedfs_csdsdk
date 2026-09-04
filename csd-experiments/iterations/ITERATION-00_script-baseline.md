@@ -68,8 +68,8 @@ Shell 脚本对单个 chunk 计算。该版本用于明确后续 CSD 改造要�
 已有实验数据见:
 
 - `csd-experiments/REPORT.md`
-- `csd-experiments/REPORT_SERVER.md`
-- `csd-experiments/REPORT_SERVER_TABLE.md`
+- `csd-experiments/reports/REPORT_SERVER.md`
+- `csd-experiments/reports/REPORT_SERVER_TABLE.md`
 
 结论:当主机 CPU、带宽受限时,下载 + 脚本计算链路耗时显著上升,
 这正是论文中论证“计算应下沉到存储侧”的实验基础。

@@ -100,7 +100,7 @@ tan09: 220  tan10: 220  tan11: 220   (期望 220)
 
 ## 8. 复现
 
-- 实验脚本:`/home/tan/new_workspace/work/run_experiments.sh`(all/one 两种模式)
-- 原始数据:`/home/tan/new_workspace/work/results.csv`(96 行)+ `confirm_*.csv`(4×5 行)
-- 分析脚本:`/home/tan/new_workspace/work/analyze_results.py`、`final_stats.py`
+- 实验脚本:`../scripts/run_experiments.sh`(all/one 两种模式)
+- 原始数据:`../results/results.csv`(96 行)+ `../results/confirm_*.csv`(4×5 行)
+- 分析脚本:`../scripts/analyze_results.py`、`../scripts/final_stats.py`
 - 数据文件:`/home/tan/new_workspace/work/big_numbers.txt`(176MB)

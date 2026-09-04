@@ -88,7 +88,7 @@ filer 汇总 N 个 chunk:
 
 ### 4.4 文档
 
-- `csd-experiments/GUIDE_MULTI_INTERFACE.md`:多接口使用指南;
+- `csd-experiments/guides/GUIDE_MULTI_INTERFACE.md`:多接口使用指南;
 - `sop/`:文件、对象、块、统一 API 的 SOP。
 
 ## 5. 验证结果

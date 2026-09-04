@@ -1,36 +1,65 @@
-# CSD 计算下沉对比实验(SeaweedFS)
+# CSD 计算实验与文档目录
 
-本目录是 2026-08-22 在三节点 SeaweedFS(192.168.0.9/10/11,均开启
-`-volume.compute.enabled` 计算下沉)上完成的"主机端计算 vs 存储计算下沉"对比实验
-完整报告与复现工具。
+本目录是 SeaweedFS + SmartSSD 可计算存储工作的实验、文档与结果归档。
 
-## 文件
+## 创新说明
 
-| 文件 | 说明 |
-| --- | --- |
-| `REPORT.md` | 完整实验报告(部署、方法、16 组配置数据、最佳配置结论) |
-| `run_experiments.sh` | 实验驱动脚本(`all` 全网格 / `one` 单配置) |
-| `burner.sh` | CPU 满载争抢进程(配合 1c_burn 档位) |
-| `analyze_results.py` / `final_stats.py` | 结果统计与最优配置分析 |
-| `results.csv` | 全网格原始数据(16 配置 × 3 次重复 × 2 模式) |
-| `confirm_*.csv` | 最佳/亚军配置追加 5 次重复数据 |
-| `gen_data.sh` | 重新生成 176MB 测试数据集(big_numbers.txt,不入库) |
+面向论文的创新点总述与论证见 [INNOVATIONS.md](INNOVATIONS.md)。
 
-## 关键结论
+## 目录结构
 
-- 主机端计算在 CPU 争抢或带宽受限时性能急剧下降(最差 11.2s → 158.6s);
-- 计算下沉对资源限制几乎不敏感(~17.5s 恒定);
-- **最佳配置:1 核满载争抢 + 10Mbps 带宽,加速比 9.09x(8 次重复,CV<1%)**。
-
-## 复现
-
-```bash
-./gen_data.sh                       # 生成 176MB 数据集
-# 上传到 SeaweedFS filer:
-# curl -F file=@big_numbers.txt http://<filer>:8888/dataset/big_numbers.txt
-./run_experiments.sh all results.csv 3   # 全网格,3 次重复
-python3 analyze_results.py results.csv   # 汇总统计与加速比
+```text
+csd-experiments/
+├── INNOVATIONS.md            # 相对上游 SeaweedFS 的创新点说明
+├── reports/                  # 性能实验与方案报告
+├── guides/                   # 多接口使用指南
+├── scripts/                  # 实验驱动、分析与数据生成脚本
+├── results/                  # 实验原始数据 CSV
+└── iterations/               # V0-V4 迭代记录与 P2P/XRT 对比文档
 ```
 
-脚本中的 URL/路径为本次部署环境,换环境时按需修改
-`run_experiments.sh` 顶部的 `URL`/`DL_FILE` 等变量。
+## 内容索引
+
+### 创新点
+
+- [INNOVATIONS.md](INNOVATIONS.md)
+
+### 报告(reports/)
+
+- [REPORT.md](reports/REPORT.md):主机计算 vs 计算下沉全网格实验
+- [REPORT_CROSS_CHUNK.md](reports/REPORT_CROSS_CHUNK.md):跨 chunk 计算实现与验证
+- [REPORT_MULTIMODAL_INTERFACE.md](reports/REPORT_MULTIMODAL_INTERFACE.md):多模态接口
+- [REPORT_CSD_DEPLOY.md](reports/REPORT_CSD_DEPLOY.md):file_sum64 CSD 部署
+- [REPORT_CSD_IMPACT.md](reports/REPORT_CSD_IMPACT.md):CSD 争抢影响
+- [REPORT_SERVER.md](reports/REPORT_SERVER.md):Server 端资源受限实验
+- [REPORT_SERVER_CSD.md](reports/REPORT_SERVER_CSD.md):Server 端 CPU/带宽受限
+- [REPORT_SERVER_TABLE.md](reports/REPORT_SERVER_TABLE.md):Server CPU × 带宽时延表
+
+### 使用指南(guides/)
+
+- [GUIDE_MULTI_INTERFACE.md](guides/GUIDE_MULTI_INTERFACE.md):文件/对象/块调用方式
+
+### 脚本(scripts/)
+
+- `run_experiments.sh` / `run_server_experiments.sh`:主实验驱动
+- `run_server_cpu_quota.sh` / `run_server_table2.sh`:CPU/带宽限定实验
+- `run_csd_contention.sh`:CSD 争抢实验
+- `gen_data.sh`:测试数据生成
+- `burner.sh`:CPU 争抢负载
+- `analyze_*.py` / `final_*.py` / `make_server_table.py`:统计与成表
+
+### 结果(results/)
+
+- `results.csv`:主机 vs 下沉全网格
+- `results_server*.csv`:Server 端实验
+- `results_csd_contention.csv`:CSD 争抢
+- `confirm_*.csv`:最优配置确认
+
+### 版本迭代(iterations/)
+
+- [ITERATION-00](iterations/ITERATION-00_script-baseline.md):脚本+临时文件基线
+- [ITERATION-01](iterations/ITERATION-01_multimodal-upper-interface.md):跨 chunk + 多模态
+- [ITERATION-02](iterations/ITERATION-02_csd-native-region-dispatch.md):CSD 原生分派
+- [ITERATION-03](iterations/ITERATION-03_p2p-near-storage.md):P2P 数据通路
+- [ITERATION-04](iterations/ITERATION-04_csd-aware-replica-scheduling.md):CSD-aware 调度
+- [COMPARISON_P2P_vs_XRT.md](iterations/COMPARISON_P2P_vs_XRT.md):P2P vs XRT 对比

@@ -56,6 +56,6 @@
 
 ## 数据来源
 
-- `results_server.csv`(带宽 × CPU 网格,72 组)
-- `results_server_cpu_quota.csv`(CPU 配额 × 并发,27 组)
-- 分析脚本:`analyze_server.py`、`analyze_server_table.py`
+- `../results/results_server.csv`(带宽 × CPU 网格,72 组)
+- `../results/results_server_cpu_quota.csv`(CPU 配额 × 并发,27 组)
+- 分析脚本:`../scripts/analyze_server.py`、`../scripts/make_server_table.py`
