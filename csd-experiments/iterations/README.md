@@ -11,7 +11,8 @@
 | V1 | 跨 chunk + 文件/对象/块多模态上层接口 | 已完成 | [ITERATION-01](ITERATION-01_multimodal-upper-interface.md) |
 | V2 | SeaweedFS CSD 原生分派 + SmartSSD agent | 已完成(部分集成) | [ITERATION-02](ITERATION-02_csd-native-region-dispatch.md) |
 | V3 | P2P / 盘直通 FPGA | 已完成(agent 侧真机验证) | [ITERATION-03](ITERATION-03_p2p-near-storage.md) |
-| V4 | CSD-aware 副本选择策略 | 已完成(单元验证) | [ITERATION-04](ITERATION-04_csd-aware-replica-scheduling.md) |
+| V4 | 早期 CSD-aware 副本选择(CSD 优先 + 延迟) | 已完成 | [ITERATION-04](ITERATION-04_csd-aware-replica-scheduling.md) |
+| V5 | 增强 CSD-aware 调度(负载感知 + 原子预留 + 失败重试) | 已完成(单元验证) | [ITERATION-05](ITERATION-05_enhanced-csd-aware-scheduling.md) |
 | 对比 | P2P 直通 vs XRT 搬移 | 初步测量 | [COMPARISON-P2P-vs-XRT](COMPARISON_P2P_vs_XRT.md) |
 
 ## 文档维护约定
