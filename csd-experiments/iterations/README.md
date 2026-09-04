@@ -12,6 +12,7 @@
 | V2 | SeaweedFS CSD 原生分派 + SmartSSD agent | 已完成(部分集成) | [ITERATION-02](ITERATION-02_csd-native-region-dispatch.md) |
 | V3 | P2P / 盘直通 FPGA | 已完成(agent 侧真机验证) | [ITERATION-03](ITERATION-03_p2p-near-storage.md) |
 | V4 | CSD-aware 副本选择策略 | 已完成(单元验证) | [ITERATION-04](ITERATION-04_csd-aware-replica-scheduling.md) |
+| 对比 | P2P 直通 vs XRT 搬移 | 初步测量 | [COMPARISON-P2P-vs-XRT](COMPARISON_P2P_vs_XRT.md) |
 
 ## 文档维护约定
 

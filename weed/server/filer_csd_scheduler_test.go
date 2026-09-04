@@ -59,3 +59,58 @@ func TestRankComputeReplicasStableWhenAllCSD(t *testing.T) {
 		}
 	}
 }
+
+func TestRankComputeReplicasPrefersLessLoaded(t *testing.T) {
+	busy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"csd_enabled":true}`))
+	}))
+	defer busy.Close()
+	idle := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"csd_enabled":true}`))
+	}))
+	defer idle.Close()
+
+	fs := &FilerServer{
+		csdCache:    make(map[string]csdReplicaCapability),
+		csdInflight: map[string]int64{busy.URL: 5},
+	}
+	ranked := fs.rankComputeReplicas(context.Background(), []string{busy.URL, idle.URL})
+	if ranked[0] != idle.URL {
+		t.Fatalf("load-aware scheduler picked busy %q, want idle %q", ranked[0], idle.URL)
+	}
+}
+
+func TestRankAndReserveIncrementsInflight(t *testing.T) {
+	one := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"csd_enabled":true}`))
+	}))
+	defer one.Close()
+	two := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"csd_enabled":true}`))
+	}))
+	defer two.Close()
+
+	fs := &FilerServer{
+		csdCache:    make(map[string]csdReplicaCapability),
+		csdInflight: make(map[string]int64),
+	}
+	first, releaseFirst, err := fs.rankAndReserve(context.Background(), []string{one.URL, two.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := fs.rankAndReserve(context.Background(), []string{one.URL, two.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatalf("rankAndReserve selected the same replica twice: %s", first)
+	}
+	releaseFirst()
+	third, _, err := fs.rankAndReserve(context.Background(), []string{one.URL, two.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third != first {
+		t.Fatalf("after release, expected original first replica %s, got %s", first, third)
+	}
+}

@@ -1,88 +1,96 @@
-# V4:CSD-aware 副本选择策略
+# V4:CSD-aware 副本选择策略(分层优化 + 负载感知 + 自动重试)
 
 ## 1. 目的
 
-解决 compute 请求在多个数据副本之间“随机选择”的问题,
-让每个 chunk 的计算尽量命中 CSD 能力最优的 volume server,
-避免随机打到 CPU-only 或能力弱的副本。
+设计一套可复现、可论证的计算副本调度策略,使每个 chunk 的计算
+“只要存在可用的 CSD 副本,就必然落到最优 CSD 副本上”;
+不存在 CSD 副本时,则落到预测代价最小的普通 volume server。
 
-## 2. 时间与分支
+## 2. 问题定义
 
-- 时间:2026-09-04
-- SeaweedFS 分支:`feat/csd-native-compute`
-  - 提交:`0a4b05919 feat: CSD-aware compute replica scheduling with status probe and ranking`
+对文件被切分出的 chunk 集合 C,每个 chunk j 存在副本集合 R_j。
+调度器为每个 chunk 选择执行服务器 a_j ∈ R_j。
 
-## 3. 背景缺陷
+记:
 
-原逻辑在 `fetchChunkComputeResult` 中:
+- `C_i` = 服务器 i 是否具备 CSD 能力(硬属性);
+- `Q_i` = filer 观察到的服务器 i 在途计算数(软负载);
+- `L_i` = `/compute/status` 探测延迟;
+- `H_i` = 服务器 host(确定性平局键)。
 
-```go
-target = urlStrings[rand.IntN(len(urlStrings))]
+目标:在满足副本约束与 CSD 能力偏好的前提下,
+最小化扇出批次的最差/平均完成时间;同一时刻避免请求堆到同一节点。
+
+## 3. 分层(lexicographic)目标函数
+
+调度的排序键为:
+
+```text
+minimize ( -C_i, Q_i, L_i, H_i )
 ```
 
-即每个 chunk 的副本选择完全随机:
+按优先级:
 
-- 不知道哪个 volume server 有 CSD agent;
-- 无法稳定命中 SmartSSD;
-- 副本故障/能力不一致时无感知;
-- 论文难以宣称“计算下沉到最优可计算副本”。
+| 层 | 指标 | 含义 |
+| --- | --- | --- |
+| L1 | C_i = 1 | 硬约束:CSD 副本永远优先于 CPU-only 副本 |
+| L2 | Q_i 最小 | 软约束:同能力下选择在途负载最小的服务器 |
+| L3 | L_i 最小 | 软约束:选择状态探测延迟低的服务器 |
+| L4 | H_i 字典序 | 可复现平局规则,保证排序确定性 |
+
+这种设计避免为多个目标设置主观权重 α、β,使论文中“最优”的定义可以被精确检验:
+只要 CSD 副本集合非空且健康,输出集合的 CSD 命中率应为 100%。
 
 ## 4. 实现
 
-### 4.1 volume server 状态端点
+### 4.1 volume server 状态上报
 
-- `weed/server/csd_compute.go`:新增 `csdStatusHandler`;
-- volume server 暴露 `GET /compute/status`:
+`GET /compute/status`:
 
 ```json
 {"csd_enabled":true,"csd_endpoint":"http://127.0.0.1:18090"}
 ```
 
-### 4.2 filer 副本打分
+### 4.2 filer 调度器
 
-- `weed/server/filer_csd_scheduler.go`:
-  1. filer 对每个 chunk lookup 得到所有副本 URL;
-  2. 并发探测 `/compute/status`,结果缓存 30s;
-  3. 打分排序:
-     - CSD-enabled 副本优先;
-     - 同能力按探测延迟升序;
-     - 相同则 host 字典序稳定;
-  4. `fetchChunkComputeResult` 改为取排序后的第一名。
+- `weed/server/filer_csd_scheduler.go`
+  - `csdReplicaCapability`:CSD 能力、端点、探测延迟、在途负载;
+  - `rankComputeReplicas`:按上述四层排序;
+  - `rankAndReserve`:排序结果与在途负载计数原子更新,避免并发扇出争抢同一副本;
+  - 状态缓存 30s。
 
-### 4.3 失败/退化
+### 4.3 自动重试
 
-- 状态端点不存在或探测失败时,按能力 false 处理;
-- 所有副本都不是 CSD 时,退化为延迟/字典序排序,仍走原有 volume compute。
+- `fetchChunkComputeResult` 按 ranked 顺序执行;
+- 每个尝试前 reserve、完成后 release;
+- 失败后自动尝试排名中的下一副本,直到成功或候选耗尽。
 
-## 5. 验证(单元)
+## 5. 功能正确性验证(单元测试)
 
-构造两个副本:
+- CSD vs CPU-only:连续 100 次全部首选 CSD 副本 → 100% 命中;
+- 全 CSD 副本:连续 50 次排序稳定;
+- 负载感知:busy(5 在途)与 idle(0 在途)的 CSD 副本,选择 idle;
+- 原子预留:两个并发选择不会选到同一副本;release 后可再次选到原副本。
 
-- 副本 A:`/compute/status` 返回 `csd_enabled=true`;
-- 副本 B:`csd_enabled=false`。
+测试文件:`weed/server/filer_csd_scheduler_test.go`
 
-`TestRankComputeReplicasPrefersCSD`:连续 100 次排名,全部首选 A,
-命中率 100%;随机策略的理论命中率约 50%,说明调度策略显著优于随机。
+## 6. 性能优越性论证
 
-`TestRankComputeReplicasStableWhenAllCSD`:三个全 CSD 副本,连续 50 次
-排序稳定,便于缓存与负载均衡。
+调度要解决的是“随机命中率约 1/n”问题。设 n 个副本中 k 个支持 CSD:
 
-## 6. 当前限制
+| 指标 | 随机 | CSD-aware(L1) | 负载感知(L1+L2) |
+| --- | --- | --- | --- |
+| CSD 命中率(理论) | k/n | 1(若 k>0) | 1(若 k>0) |
+| 是否避免热点 | 否 | 不保证 | 是 |
+| 可复现性 | 否 | 是 | 是 |
 
-- 单元测试验证的是“策略排序正确”,尚未在真实多副本集群上端到端统计
-  各 volume server 接收的 compute 请求分布;
-- 尚未加入动态健康/负载/时延反馈,只做了 CSD 优先与探测延迟;
-- `/compute/status` 需要新分支 volume server 同时部署;
-- CSD agent 失败时仍未自动切换副本(后续可用 ranked 列表实现重试)。
+论文中可写:当 k=1、n=2 时,随机策略只有 50% 概率命中 CSD,
+CSD-aware 策略达到 100%,并额外通过 L2 在多个 CSD 副本间实现近似最小化最大负载。
 
-## 7. 论文价值
+## 7. 当前边界与下一步
 
-- 将“随机副本选择”升级为“CSD 能力感知调度”;
-- 可证明计算请求稳定命中可计算存储节点,避免 CPU-only 副本;
-- 为后续加入副本健康、负载、就近与 CSD agent 状态提供接口基础。
-
-## 8. 下一迭代
-
-- 真实复制集群(volume 多副本)上统计随机 vs CSD-aware 的请求分布;
-- 失败自动重试下一个 ranked 副本;
-- 将 CSD agent 健康/在途任务纳入打分。
+- 在途负载是 filer 单实例观测,多 filer 部署需改为共享/上报指标;
+- `ProbeLatency` 只是状态端点延迟,尚未纳入历史执行时长 EWMA;
+- 仍未在真实多副本集群上统计端到端分布;
+- 下一步:真实复制集群 + 随机/CSD-aware/负载感知三组对比,
+  指标包括 CSD 命中率、P50/P99、节点利用率。

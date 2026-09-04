@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -27,6 +26,7 @@ type csdReplicaCapability struct {
 	CSDEnabled     bool
 	CSDEndpoint    string
 	ProbeLatencyMs int64
+	Inflight       int64
 	ProbedAt       time.Time
 	ProbeErr       error
 }
@@ -53,19 +53,30 @@ func (fs *FilerServer) rankComputeReplicas(ctx context.Context, urlStrings []str
 				results[idx] = capResult{idx, csdReplicaCapability{BaseURL: raw, ProbeErr: err}}
 				return
 			}
-			results[idx] = capResult{idx, fs.computeReplicaCapability(ctx, u)}
+			cap := fs.computeReplicaCapability(ctx, u)
+			if fs.csdInflight != nil {
+				cap.Inflight = fs.csdInflight[cap.Host]
+			}
+			results[idx] = capResult{idx, cap}
 		}(i, raw)
 	}
 	wg.Wait()
 
 	sort.SliceStable(results, func(i, j int) bool {
 		a, b := results[i].cap, results[j].cap
+		// Hard constraint: CSD-capable replicas always outrank CPU-only ones.
 		if a.CSDEnabled != b.CSDEnabled {
 			return a.CSDEnabled
 		}
+		// Soft constraint 1: minimize filer-side in-flight load.
+		if a.Inflight != b.Inflight {
+			return a.Inflight < b.Inflight
+		}
+		// Soft constraint 2: lower status-probe latency first.
 		if a.ProbeLatencyMs != b.ProbeLatencyMs {
 			return a.ProbeLatencyMs < b.ProbeLatencyMs
 		}
+		// Deterministic tie-breaker for reproducibility.
 		return a.Host < b.Host
 	})
 	ranked := make([]string, 0, len(results))
@@ -131,14 +142,34 @@ func (fs *FilerServer) probeCSDStatus(ctx context.Context, statusURL string, out
 	return nil
 }
 
-// pickComputeReplica returns a ranked candidate for one chunk. Multiple chunks
-// independently pick their best replica, which balances CSD-capable volume
-// servers across the fan-out.
-func pickComputeReplica(_ []string, ranked []string) string {
-	for _, u := range ranked {
-		if strings.TrimSpace(u) != "" {
-			return u
-		}
+// rankAndReserve picks the current best replica and atomically increments its
+// in-flight count so concurrent fan-out requests spread across the best CSD
+// replicas instead of stampeding onto the first one. The returned release
+// function decrements the count when the compute attempt finishes.
+func (fs *FilerServer) rankAndReserve(ctx context.Context, urlStrings []string) (string, func(), error) {
+	fs.csdSchedMu.Lock()
+	defer fs.csdSchedMu.Unlock()
+	if fs.csdInflight == nil {
+		fs.csdInflight = make(map[string]int64)
 	}
-	return ""
+	ranked := fs.rankComputeReplicas(ctx, urlStrings)
+	if len(ranked) == 0 {
+		return "", func() {}, fmt.Errorf("no rankable compute replica")
+	}
+	u, err := url.Parse(ranked[0])
+	if err != nil {
+		return "", func() {}, err
+	}
+	host := u.Host
+	fs.csdInflight[host]++
+	var released bool
+	return ranked[0], func() {
+		fs.csdSchedMu.Lock()
+		defer fs.csdSchedMu.Unlock()
+		if released {
+			return
+		}
+		released = true
+		fs.csdInflight[host]--
+	}, nil
 }
