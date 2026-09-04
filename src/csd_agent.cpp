@@ -12,6 +12,7 @@
 #define CL_USE_DEPRECATED_OPENCL_1_2_APIS
 
 #include <CL/cl2.hpp>
+#include <CL/cl_ext_xilinx.h>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -169,27 +170,49 @@ class OpenClRuntime {
       return "0";
     }
     const std::size_t byte_count = static_cast<std::size_t>(req.size);
-    std::vector<unsigned char, aligned_allocator<unsigned char>> bytes(byte_count, 0);
 
-    const int fd = ::open(req.data_file.c_str(), O_RDONLY);
+    cl_int err = CL_SUCCESS;
+
+    // P2P buffer: map FPGA device memory into the host address space and read
+    // the disk range straight into it. No host CL buffer and no XRT migrate of
+    // the payload are needed.
+    cl_mem_ext_ptr_t ext{};
+    ext.flags = XCL_MEM_EXT_P2P_BUFFER;
+    cl::Buffer input(*context_, CL_MEM_READ_WRITE | CL_MEM_EXT_PTR_XILINX,
+                     byte_count, &ext, &err);
+    if (err != CL_SUCCESS) {
+      throw std::runtime_error("create P2P input buffer failed");
+    }
+    unsigned char* p2p = static_cast<unsigned char*>(queue_->enqueueMapBuffer(
+        input, CL_TRUE, CL_MAP_WRITE, 0, byte_count, nullptr, nullptr, &err));
+    if (p2p == nullptr || err != CL_SUCCESS) {
+      throw std::runtime_error("map P2P input buffer failed");
+    }
+
+    int fd = ::open(req.data_file.c_str(), O_RDONLY);
     if (fd < 0) {
       throw std::runtime_error("cannot open data file " + req.data_file);
     }
-    const ssize_t got = ::pread(fd, bytes.data(), byte_count,
-                                static_cast<off_t>(req.offset));
+    // Use O_DIRECT only when the range can satisfy alignment; otherwise a plain
+    // pread still writes through the P2P mapping (no host CL buffer copy).
+    bool direct_ok = (req.offset % 512 == 0) && (req.size % 512 == 0);
+    if (direct_ok) {
+      const int fd_direct = ::open(req.data_file.c_str(), O_RDONLY | O_DIRECT);
+      if (fd_direct >= 0) {
+        ::close(fd);
+        fd = fd_direct;
+      }
+    }
+    const ssize_t got = ::pread(fd, p2p, byte_count, static_cast<off_t>(req.offset));
     ::close(fd);
     if (got < 0) {
-      throw std::runtime_error("cannot read data range " + req.data_file);
+      throw std::runtime_error("cannot read data range into P2P buffer " + req.data_file);
     }
-    // The kernel packs every 8 bytes itself; the final partial word is padded.
+    OCL_CHECK(err, err = queue_->enqueueUnmapMemObject(input, p2p));
 
-    cl_int err = CL_SUCCESS;
-    cl::Buffer input(*context_, CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
-                     byte_count, bytes.data(), &err);
-    if (err != CL_SUCCESS) throw std::runtime_error("create input buffer failed");
-    uint64_t result = 0;
+    std::vector<uint64_t, aligned_allocator<uint64_t>> result(1, 0);
     cl::Buffer output(*context_, CL_MEM_WRITE_ONLY | CL_MEM_USE_HOST_PTR,
-                      sizeof(uint64_t), &result, &err);
+                      sizeof(uint64_t), result.data(), &err);
     if (err != CL_SUCCESS) throw std::runtime_error("create output buffer failed");
 
     cl::Kernel kernel(*program_, "file_sum64", &err);
@@ -198,12 +221,11 @@ class OpenClRuntime {
     OCL_CHECK(err, err = kernel.setArg(arg++, input));
     OCL_CHECK(err, err = kernel.setArg(arg++, static_cast<uint32_t>(byte_count)));
     OCL_CHECK(err, err = kernel.setArg(arg++, output));
-    OCL_CHECK(err, err = queue_->enqueueMigrateMemObjects({input}, 0));
     OCL_CHECK(err, err = queue_->enqueueTask(kernel));
     OCL_CHECK(err, err = queue_->enqueueMigrateMemObjects({output},
                                                          CL_MIGRATE_MEM_OBJECT_HOST));
     OCL_CHECK(err, err = queue_->finish());
-    return std::to_string(result);
+    return std::to_string(result[0]);
   }
 
  private:
