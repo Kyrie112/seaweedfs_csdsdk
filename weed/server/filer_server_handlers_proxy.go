@@ -215,15 +215,36 @@ func (fs *FilerServer) fetchChunkComputeResult(ctx context.Context, r *http.Requ
 	if len(urlStrings) == 0 {
 		return nil, fmt.Errorf("no volume server for compute target %s", fileId)
 	}
-	// CSD-aware replica selection: probe /compute/status on each replica and
-	// prefer CSD-capable servers, then lower probe latency. If no replica is
-	// CSD-capable (or the status endpoint is absent), ranking degrades to
-	// latency/lexicographic order and the regular volume compute path is used.
-	ranked := fs.rankComputeReplicas(ctx, urlStrings)
-	if len(ranked) == 0 {
-		return nil, fmt.Errorf("no rankable volume server for compute target %s", fileId)
+
+	// Scientific scheduling: rank is a lexicographic objective:
+	//   1. hard constraint - CSD capability;
+	//   2. filer-side in-flight load (least loaded first);
+	//   3. status-probe latency;
+	//   4. deterministic host tie-breaker.
+	// Each attempt reserves the chosen replica's load, and on failure the next
+	// best replica is tried automatically.
+	var lastErr error
+	for attempt := 0; attempt < len(urlStrings); attempt++ {
+		raw, release, err := fs.rankAndReserve(ctx, urlStrings)
+		if err != nil {
+			return nil, err
+		}
+		body, err := fs.fetchFromComputeReplica(ctx, r, fileId, filename, operation, raw)
+		release()
+		if err == nil {
+			return body, nil
+		}
+		glog.Warningf("compute %q via %s failed, trying next replica: %v", operation, raw, err)
+		lastErr = err
 	}
-	target, err := url.Parse(ranked[0])
+	if lastErr == nil {
+		lastErr = fmt.Errorf("compute target %s failed on all replicas", fileId)
+	}
+	return nil, lastErr
+}
+
+func (fs *FilerServer) fetchFromComputeReplica(ctx context.Context, r *http.Request, fileId string, filename string, operation string, replicaURL string) ([]byte, error) {
+	target, err := url.Parse(replicaURL)
 	if err != nil {
 		return nil, err
 	}

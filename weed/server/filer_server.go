@@ -157,6 +157,11 @@ type FilerServer struct {
 	// /compute/status endpoint on every chunk.
 	csdMu    sync.RWMutex
 	csdCache map[string]csdReplicaCapability
+
+	// csdSchedMu serializes rank+reserve so concurrent chunk fan-out cannot
+	// choose the same replica before in-flight counts are updated.
+	csdSchedMu  sync.Mutex
+	csdInflight map[string]int64
 }
 
 func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption) (fs *FilerServer, err error) {
@@ -199,6 +204,7 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 		entryLockTable:        util.NewLockTable[util.FullPath](),
 		posixLocks:            posixlock.NewManager(),
 		csdCache:              make(map[string]csdReplicaCapability),
+		csdInflight:           make(map[string]int64),
 	}
 	fs.startPosixLockSweeper()
 	fs.mountPeerRegistry = filer.NewMountPeerRegistry()
