@@ -101,3 +101,15 @@ SeaweedFS volume 侧:
 
    测试数据:8 个 little-endian uint64 `[3,10,17,24,31,38,45,52]`,
    期望 `220`,实际 agent 返回 `220`;非零 offset 场景同样返回 `220`。
+
+## P2P 版本(V3)
+
+`src/csd_agent.cpp` 使用 `XCL_MEM_EXT_P2P_BUFFER` 创建输入缓冲区,
+`pread` 直接写入 FPGA device memory 的映射,不再经过 host CL buffer 与
+XRT migrate;offset/size 满足 512B 对齐时启用 `O_DIRECT`。
+
+真机验证:
+
+- 64B 非对齐请求:offset 0 → 54,offset 32 → 220;
+- 512B O_DIRECT+P2P 请求:期望 1760,返回 1760;
+- 日志不再出现 `unaligned host pointer ... extra memcpy`。
