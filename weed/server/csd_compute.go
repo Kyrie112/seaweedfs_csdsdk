@@ -42,6 +42,23 @@ func (vs *VolumeServer) csdSupported() bool {
 	return vs.computeConfig.CSDEnabled && vs.computeConfig.CSDEndpoint != ""
 }
 
+// csdStatusResponse tells filer schedulers whether this volume server can
+// offload compute to a local CSD agent and where that agent listens.
+type csdStatusResponse struct {
+	CSDEnabled  bool   `json:"csd_enabled"`
+	CSDEndpoint string `json:"csd_endpoint,omitempty"`
+}
+
+// csdStatusHandler is probed by the filer before choosing which replica should
+// execute a CSD-native compute request.
+func (vs *VolumeServer) csdStatusHandler(w http.ResponseWriter, r *http.Request) {
+	resp := csdStatusResponse{
+		CSDEnabled:  vs.csdSupported(),
+		CSDEndpoint: vs.computeConfig.CSDEndpoint,
+	}
+	writeJsonQuiet(w, r, http.StatusOK, resp)
+}
+
 // tryHandleCSDCompute tries to serve one needle compute request through the
 // configured CSD engine. It returns true only when it wrote a response.
 // Any unsupported or failed case returns false so the caller can fall back to

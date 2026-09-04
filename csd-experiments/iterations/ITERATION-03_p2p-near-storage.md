@@ -62,6 +62,23 @@ offset=0, size=512 → {"result":"1760"} ✓
 [XRT] WARNING: unaligned host pointer detected, this leads to extra memcpy
 ```
 
+### 5.3 256MB 效率对比(真机)
+
+数据:256MB 全零、512B 对齐;每个模式 3 轮,agent 常驻;
+
+| 轮次 | V2 host CL buffer | V3 P2P(O_DIRECT) |
+| --- | --- | --- |
+| 1 | 10.30s | 12.39s(冷读) |
+| 2 | 10.14s | 10.86s |
+| 3 | 10.14s | 10.87s |
+
+功能正确:每轮均返回 0。
+
+分析:当前 file_sum64 为串行累加内核,计算本身主导端到端时间,
+P2P 在“数据搬运阶段”的优势被计算/磁盘读掩盖;从日志看 V3 不再出现
+`unaligned host pointer ... extra memcpy`。真正体现 P2P 收益需要:
+更高吞吐并行内核、真实 SmartSSD NVMe 路径、按 pread/migrate/kernel 分阶段计时。
+
 ## 6. 相比 V2 消除的缺陷
 
 | 缺陷 | V2 | V3 |

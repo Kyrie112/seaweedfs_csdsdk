@@ -151,6 +151,12 @@ type FilerServer struct {
 	// state. Atomic so the handler reads it without locking; 0 means "not warming
 	// up" (e.g. in tests).
 	posixLockReadyAt atomic.Int64
+
+	// csdCache caches the CSD compute capability of volume-server replicas so
+	// the compute scheduler can prefer CSD-capable replicas without probing the
+	// /compute/status endpoint on every chunk.
+	csdMu    sync.RWMutex
+	csdCache map[string]csdReplicaCapability
 }
 
 func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption) (fs *FilerServer, err error) {
@@ -192,6 +198,7 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 		CredentialManager:     option.CredentialManager,
 		entryLockTable:        util.NewLockTable[util.FullPath](),
 		posixLocks:            posixlock.NewManager(),
+		csdCache:              make(map[string]csdReplicaCapability),
 	}
 	fs.startPosixLockSweeper()
 	fs.mountPeerRegistry = filer.NewMountPeerRegistry()
