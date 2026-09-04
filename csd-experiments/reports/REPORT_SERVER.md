@@ -70,11 +70,11 @@
 ## 6. 复现
 
 ```bash
-./run_server_experiments.sh all results_server.csv 3   # 全网格
-./run_server_experiments.sh one host 2c 1M 5           # 最优配置确认
-python3 analyze_server.py                               # 汇总统计与加速比
+../scripts/run_server_experiments.sh all ../results/results_server.csv 3   # 全网格
+../scripts/run_server_experiments.sh one host 2c 1M 5           # 最优配置确认
+python3 ../scripts/analyze_server.py                               # 汇总统计与加速比
 ```
 
-- 脚本:`run_server_experiments.sh`(Server 端实验驱动)
-- 数据:`results_server.csv`(72 行)、`confirm_server_host_2c_1M.csv`、`confirm_server_offload_2c_1M.csv`
-- 分析:`analyze_server.py`、`final_server_stats.py`
+- 脚本:`../scripts/run_server_experiments.sh`(Server 端实验驱动)
+- 数据:`../results/results_server.csv`(72 行)、`../results/confirm_server_host_2c_1M.csv`、`../results/confirm_server_offload_2c_1M.csv`
+- 分析:`../scripts/analyze_server.py`、`../scripts/final_server_stats.py`

@@ -47,6 +47,6 @@
 
 ## 5. 复现与数据
 
-- 脚本:`run_server_table2.sh`(含端口等待修复)
-- 原始数据:`results_server_table.csv`(44 组)
-- 表格生成:`make_server_table.py`
+- 脚本:`../scripts/run_server_table2.sh`(含端口等待修复)
+- 原始数据:`../results/results_server_table.csv`(44 组)
+- 表格生成:`../scripts/make_server_table.py`

@@ -53,7 +53,7 @@ FPGA 内核计算结果与 CPU 参考一致,算子部署成功。
 
 ## 5. 数据与复现
 
-- 脚本:`run_csd_contention.sh`(争抢梯度实验)
-- 数据:`results_csd_contention.csv`(36 组)
-- 分析:`analyze_csd.py`
+- 脚本:`../scripts/run_csd_contention.sh`(争抢梯度实验)
+- 数据:`../results/results_csd_contention.csv`(36 组)
+- 分析:`../scripts/analyze_csd.py`
 - 部署产物:192.168.0.10 `/home/dess/Dess/file_sum64/build/`(host + xclbin)
