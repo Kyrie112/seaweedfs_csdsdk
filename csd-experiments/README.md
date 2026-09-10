@@ -22,6 +22,7 @@ csd-experiments/
 
 ### 规划
 
+- [reports/REPORT_PROJECT_OVERVIEW.md](reports/REPORT_PROJECT_OVERVIEW.md):**项目总览汇报**(面向不了解本工作的读者,含速览/背景/逐条工作/结果/讲稿)
 - [ROADMAP.md](ROADMAP.md):后续工作计划(阶段一机制修复 / 阶段二调度模型 / 阶段三算子与实验)
 - [tools/csd-agent-sim](tools/csd-agent-sim):无 FPGA 的软件 CSD agent(同协议、同语义)
 - [scripts/run_phase1_local.sh](scripts/run_phase1_local.sh):本地部署 + 读路径/自适应策略性能实验
