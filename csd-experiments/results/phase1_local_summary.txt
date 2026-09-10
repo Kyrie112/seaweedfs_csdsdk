@@ -1,0 +1,30 @@
+Phase-1 local deployment experiment summary
+SeaweedFS master+volume+filer (replication 000), software CSD agent, file 64MB -> 16 chunks, 9 reps/config
+
+wall time per compute request (ms)
+mode    cache    median      p25      min      max
+legacy  warm       32.7     31.9     26.7     38.9
+legacy  cold      257.2    239.3    235.6   1805.8
+aligned warm       32.1     30.4     30.2     33.7
+aligned cold      241.6    221.9    204.8    330.2
+direct  warm      173.8    171.9    168.9    182.3
+direct  cold      188.3    185.1    183.2    289.1
+
+device read time, sum over the 16 concurrent chunks (ms)
+legacy  warm   median=   80.0 mean=   81.3
+legacy  cold   median= 1584.0 mean= 2409.8
+aligned warm   median=   97.0 mean=   99.2
+aligned cold   median= 1493.0 mean= 1517.8
+direct  warm   median= 1101.0 mean= 1102.8
+direct  cold   median= 1081.0 mean= 1188.6
+
+agent bytes read per request (cumulative counter delta)
+legacy  warm   read=67108864 payload=67108864 overhead=0
+
+O_DIRECT engagement (chunks using O_DIRECT per request, 16 chunks/request)
+legacy   direct_hits=[0]
+aligned  direct_hits=[0]
+direct   direct_hits=[16]
+
+consistency: distinct results = {'190022035469879755652'}
+consistency: distinct http codes = {'200'}
