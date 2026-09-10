@@ -7,9 +7,11 @@
 // 512-byte window and skipping payload_shift bytes yields bit-identical results
 // to packing a buffer that starts at the payload.
 #include "aligned_range.h"
+#include "image_topk.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <utility>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
@@ -38,6 +40,40 @@ std::vector<uint8_t> make_pattern(size_t size) {
     data[i] = static_cast<uint8_t>(state >> 24);
   }
   return data;
+}
+
+// merge_partials mirrors the filer-side merge: sort by (distance, index) and
+// keep the best k. It is written independently of image_topk's incremental
+// insertion so the comparison below is not circular.
+std::string merge_partials(const std::vector<std::string>& partials, int k) {
+  std::vector<std::pair<int64_t, int64_t>> hits;
+  for (const std::string& partial : partials) {
+    std::size_t cursor = 0;
+    while (cursor < partial.size()) {
+      const std::size_t comma = partial.find(',', cursor);
+      const std::string entry = partial.substr(cursor, comma == std::string::npos
+                                                            ? std::string::npos
+                                                            : comma - cursor);
+      const std::size_t colon = entry.find(':');
+      hits.emplace_back(std::stoll(entry.substr(0, colon)),
+                        std::stoll(entry.substr(colon + 1)));
+      if (comma == std::string::npos) break;
+      cursor = comma + 1;
+    }
+  }
+  // Rank by distance and only then by index, exactly like the filer merge.
+  std::sort(hits.begin(), hits.end(),
+            [](const std::pair<int64_t, int64_t>& a,
+               const std::pair<int64_t, int64_t>& b) {
+              if (a.second != b.second) return a.second < b.second;
+              return a.first < b.first;
+            });
+  std::string out;
+  for (std::size_t i = 0; i < hits.size() && static_cast<int>(i) < k; ++i) {
+    if (i > 0) out += ',';
+    out += std::to_string(hits[i].first) + ":" + std::to_string(hits[i].second);
+  }
+  return out;
 }
 
 }  // namespace
@@ -209,6 +245,78 @@ int main() {
         csd::plan_aligned_window(4096, 4096, csd::kReadAlignment);
     check(csd::available_in_window(past_eof, 1024) == 0,
           "a window entirely past EOF has no available bytes");
+  }
+
+  // 8. Image descriptor: the definition is fixed, so pin two extreme records.
+  {
+    std::vector<uint8_t> black(csd::kImageRecordSize, 0);
+    std::vector<uint8_t> white(csd::kImageRecordSize, 255);
+    int32_t descriptor[csd::kDescriptorDims];
+
+    csd::image_descriptor(black.data(), descriptor);
+    check(descriptor[0] == csd::kImageRecordSize, "black image: histogram bin 0");
+    for (int i = 64; i < csd::kDescriptorDims; ++i) {
+      check(descriptor[i] == 0, "black image: quadrant sums are zero");
+    }
+
+    csd::image_descriptor(white.data(), descriptor);
+    check(descriptor[63] == csd::kImageRecordSize, "white image: histogram bin 63");
+    for (int i = 64; i < csd::kDescriptorDims; ++i) {
+      check(descriptor[i] == 32 * 32 * 255, "white image: quadrant sum");
+    }
+    int32_t black_descriptor[csd::kDescriptorDims];
+    int32_t white_descriptor[csd::kDescriptorDims];
+    csd::image_descriptor(black.data(), black_descriptor);
+    csd::image_descriptor(white.data(), white_descriptor);
+    check(csd::descriptor_distance(black_descriptor, white_descriptor) > 0,
+          "black and white descriptors must differ");
+  }
+
+  // 9. The cross-chunk property of the search operator: scanning record-aligned
+  //    chunks and merging the partial top-k lists must give exactly the same
+  //    answer as scanning the whole gallery in one pass.
+  {
+    const int records = 257;  // deliberately not divisible by the chunk count
+    std::vector<uint8_t> gallery(static_cast<std::size_t>(records) * csd::kImageRecordSize);
+    for (int r = 0; r < records; ++r) {
+      for (int j = 0; j < csd::kImageRecordSize; ++j) {
+        gallery[static_cast<std::size_t>(r) * csd::kImageRecordSize + j] =
+            static_cast<uint8_t>((r * 7 + (j / 64) * 3 + (j % 64) / 8 + (r % 5) * 11) & 0xFF);
+      }
+    }
+    int32_t query[csd::kDescriptorDims];
+    csd::image_descriptor(gallery.data() + 17 * csd::kImageRecordSize, query);
+    query[0] += 3;
+    query[64] -= 2;
+
+    const std::string full = csd::image_topk(gallery.data(), 0,
+                                             static_cast<int64_t>(gallery.size()),
+                                             csd::kImageRecordSize, query, 5);
+    check(!full.empty(), "whole-gallery search returned nothing");
+
+    std::vector<std::string> partials;
+    const int chunks = 4;
+    for (int c = 0; c < chunks; ++c) {
+      const int64_t first = static_cast<int64_t>(records) * c / chunks;
+      const int64_t last = static_cast<int64_t>(records) * (c + 1) / chunks;
+      const int64_t base = first * csd::kImageRecordSize;
+      const int64_t size = (last - first) * csd::kImageRecordSize;
+      partials.push_back(csd::image_topk(gallery.data() + base, base, size,
+                                         csd::kImageRecordSize, query, 5));
+    }
+    const std::string merged = merge_partials(partials, 5);
+    check(merged == full,
+          "per-chunk top-k + merge = " + merged + " but whole gallery = " + full);
+
+    // A range that ends in the middle of a record must simply skip that record.
+    const std::string one_and_a_half = csd::image_topk(
+        gallery.data(), 0, csd::kImageRecordSize + csd::kImageRecordSize / 2,
+        csd::kImageRecordSize, query, 5);
+    const std::string one_record =
+        csd::image_topk(gallery.data(), 0, csd::kImageRecordSize, csd::kImageRecordSize,
+                        query, 5);
+    check(one_and_a_half == one_record,
+          "a trailing partial record must be ignored, got " + one_and_a_half);
   }
 
   if (failures == 0) {

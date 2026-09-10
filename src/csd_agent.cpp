@@ -15,6 +15,7 @@
 #include <CL/cl_ext_xilinx.h>
 
 #include "aligned_range.h"
+#include "image_topk.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -34,6 +35,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -172,6 +174,10 @@ struct ComputeRequest {
   int64_t offset = 0;
   int64_t size = 0;
 
+  // Operator parameters (top-k, record size, query descriptor, logical base
+  // offset) forwarded by the volume server.
+  std::map<std::string, std::string> params;
+
   // Aligned read window sent by SeaweedFS (v2 protocol). Negative means the
   // field was absent, in which case the agent recomputes the window itself.
   int64_t read_offset = -1;
@@ -211,12 +217,53 @@ int64_t json_int_or(const std::string& body, const std::string& key,
   return json_int(body, key);
 }
 
+// json_string_map parses a flat {"key":"value"} object, which is all the
+// operator parameter channel needs.
+std::map<std::string, std::string> json_string_map(const std::string& body,
+                                                   const std::string& key) {
+  std::map<std::string, std::string> out;
+  const std::string needle = "\"" + key + "\"";
+  std::size_t position = body.find(needle);
+  if (position == std::string::npos) return out;
+  position = body.find('{', position + needle.size());
+  if (position == std::string::npos) return out;
+  const std::size_t end = body.find('}', position);
+  if (end == std::string::npos) return out;
+  const std::string inner = body.substr(position + 1, end - position - 1);
+
+  std::size_t cursor = 0;
+  while (true) {
+    const std::size_t key_start = inner.find('"', cursor);
+    if (key_start == std::string::npos) break;
+    const std::size_t key_end = inner.find('"', key_start + 1);
+    if (key_end == std::string::npos) break;
+    const std::size_t colon = inner.find(':', key_end);
+    if (colon == std::string::npos) break;
+    const std::size_t value_start = inner.find('"', colon);
+    if (value_start == std::string::npos) break;
+    const std::size_t value_end = inner.find('"', value_start + 1);
+    if (value_end == std::string::npos) break;
+    out[inner.substr(key_start + 1, key_end - key_start - 1)] =
+        inner.substr(value_start + 1, value_end - value_start - 1);
+    cursor = value_end + 1;
+  }
+  return out;
+}
+
+int64_t param_int64(const std::map<std::string, std::string>& params,
+                    const std::string& name, int64_t fallback) {
+  const auto it = params.find(name);
+  if (it == params.end() || it->second.empty()) return fallback;
+  return std::strtoll(it->second.c_str(), nullptr, 10);
+}
+
 ComputeRequest parse_request(const std::string& body) {
   ComputeRequest req;
   req.operation = json_string(body, "operation");
   req.data_file = json_string(body, "data_file");
   req.offset = json_int(body, "offset");
   req.size = json_int(body, "size");
+  req.params = json_string_map(body, "params");
   req.read_offset = json_int_or(body, "read_offset", -1);
   req.read_size = json_int_or(body, "read_size", -1);
   req.payload_shift = json_int_or(body, "payload_shift", -1);
@@ -286,7 +333,8 @@ class OpenClRuntime {
 
   // Runs one compute request and reports the device-side cost breakdown.
   ComputeOutcome sum_range(const ComputeRequest& req) {
-    if (req.operation != "rawsum64" && req.operation != "file_sum64") {
+    if (req.operation != "rawsum64" && req.operation != "file_sum64" &&
+        req.operation != "img_topk") {
       throw std::runtime_error("unsupported operation " + req.operation);
     }
     ComputeOutcome outcome;
@@ -467,6 +515,30 @@ class OpenClRuntime {
     }
     OCL_CHECK(err, err = queue_->enqueueUnmapMemObject(input, p2p));
     unmapper.active = false;
+
+    // Near-storage top-k similarity search. Until imgtopk_kernel.cpp is
+    // synthesised and loaded, the operator runs on the agent host - the data
+    // path (aligned O_DIRECT read straight into the mapped device buffer) and
+    // the protocol are identical, only the arithmetic moves.
+    if (req.operation == "img_topk") {
+      const auto query_it = req.params.find("q");
+      if (query_it == req.params.end()) {
+        ++stats_.short_reads;  // counted as a rejected request
+        throw std::runtime_error("img_topk requires a query descriptor q");
+      }
+      int32_t query[csd::kDescriptorDims];
+      csd::decode_query_descriptor(query_it->second, query);
+      const int k = static_cast<int>(param_int64(req.params, "k", 5));
+      const int64_t record_size =
+          param_int64(req.params, "rec", csd::kImageRecordSize);
+      const int64_t base = param_int64(req.params, "base_off", 0);
+      const auto kernel_start = std::chrono::steady_clock::now();
+      outcome.result = csd::image_topk(p2p + window.payload_shift, base, req.size,
+                                       record_size, query, k);
+      outcome.kernel_ms = elapsed_ms(kernel_start);
+      outcome.path += "+hosttopk";
+      return outcome;
+    }
 
     std::vector<uint64_t, aligned_allocator<uint64_t>> result(1, 0);
     cl::Buffer output(*context_, CL_MEM_WRITE_ONLY | CL_MEM_USE_HOST_PTR,
