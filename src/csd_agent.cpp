@@ -75,6 +75,7 @@ struct ComputeOutcome {
   int64_t read_offset = 0;
   int64_t read_size = 0;
   int64_t payload_shift = 0;
+  int64_t read_bytes = 0;
   int64_t read_ms = 0;
   int64_t kernel_ms = 0;
   bool direct = false;
@@ -316,20 +317,43 @@ class OpenClRuntime {
     if (fd < 0) {
       throw std::runtime_error("cannot open data file " + req.data_file);
     }
+
+    // The rounded-up window can run past the end of the volume .dat file, since
+    // the file ends exactly at the last needle's last byte. Those trailing bytes
+    // are never part of the payload, so read what exists and leave the rest of
+    // the buffer untouched. Only a payload that is itself incomplete is an error.
+    struct stat file_stat {};
+    if (::fstat(fd, &file_stat) != 0) {
+      ::close(fd);
+      throw std::runtime_error("cannot stat data file " + req.data_file);
+    }
+    const int64_t available =
+        csd::available_in_window(window, static_cast<int64_t>(file_stat.st_size));
+    if (!csd::payload_within_available(window, req.size, available)) {
+      ::close(fd);
+      ++stats_.short_reads;
+      throw std::runtime_error(
+          "needle payload is truncated: " + req.data_file + " has " +
+          std::to_string(available) + " of " +
+          std::to_string(window.payload_shift + req.size) +
+          " bytes needed at window offset " +
+          std::to_string(window.read_offset));
+    }
+
     // O_DIRECT needs an aligned file offset, an aligned length and an aligned
-    // buffer address. The window is aligned by construction, so the only
-    // remaining question is whether the P2P mapping itself is block aligned.
+    // buffer address. The window start is aligned by construction; the length
+    // must be trimmed to whole blocks, and the sub-block tail is read buffered.
+    const int64_t direct_len = available - (available % csd::kReadAlignment);
     const bool window_aligned =
-        window.read_offset % csd::kReadAlignment == 0 &&
-        window.read_size % csd::kReadAlignment == 0 &&
+        window.read_offset % csd::kReadAlignment == 0 && direct_len > 0 &&
         reinterpret_cast<uintptr_t>(p2p) % csd::kReadAlignment == 0;
+    // Keep a buffered descriptor open as well: an O_DIRECT descriptor rejects
+    // the sub-block tail read with EINVAL, so the tail must go through a normal
+    // descriptor.
+    int fd_direct = -1;
     if (window_aligned) {
-      const int fd_direct = ::open(req.data_file.c_str(), O_RDONLY | O_DIRECT);
-      if (fd_direct >= 0) {
-        ::close(fd);
-        fd = fd_direct;
-        outcome.direct = true;
-      }
+      fd_direct = ::open(req.data_file.c_str(), O_RDONLY | O_DIRECT);
+      outcome.direct = fd_direct >= 0;
     }
     if (outcome.direct) {
       ++stats_.direct_hits;
@@ -338,13 +362,30 @@ class OpenClRuntime {
     }
 
     const auto read_start = std::chrono::steady_clock::now();
-    const ssize_t got = csd::read_fully_at(fd, p2p, byte_count, window.read_offset);
+    ssize_t got = 0;
+    if (outcome.direct) {
+      got = csd::read_fully_at(fd_direct, p2p, static_cast<size_t>(direct_len),
+                               window.read_offset);
+      if (got == direct_len && available > direct_len) {
+        const ssize_t tail = csd::read_fully_at(
+            fd, p2p + direct_len, static_cast<size_t>(available - direct_len),
+            window.read_offset + direct_len);
+        got = tail < 0 ? tail : got + tail;
+      }
+    } else {
+      got = csd::read_fully_at(fd, p2p, static_cast<size_t>(available),
+                               window.read_offset);
+    }
     outcome.read_ms = elapsed_ms(read_start);
+    outcome.read_bytes = got;
+    if (fd_direct >= 0) {
+      ::close(fd_direct);
+    }
     ::close(fd);
-    if (got != static_cast<ssize_t>(byte_count)) {
+    if (got != static_cast<ssize_t>(available)) {
       ++stats_.short_reads;
       throw std::runtime_error("short read of " + req.data_file + ": wanted " +
-                               std::to_string(byte_count) + " bytes at offset " +
+                               std::to_string(available) + " bytes at offset " +
                                std::to_string(window.read_offset) + ", got " +
                                std::to_string(got));
     }
@@ -479,6 +520,7 @@ void handle_client(int client_fd, OpenClRuntime& runtime) {
                   << " shift=" << outcome.payload_shift
                   << " kernel=" << (outcome.aligned_kernel ? "v2" : "v1")
                   << " direct=" << (outcome.direct ? "yes" : "no")
+                  << " read_bytes=" << outcome.read_bytes
                   << " read_ms=" << outcome.read_ms
                   << " kernel_ms=" << outcome.kernel_ms
                   << " direct_hits=" << stats.direct_hits

@@ -62,6 +62,33 @@ inline bool covers(const AlignedWindow& window, int64_t data_offset, int64_t dat
          window.payload_shift + data_size <= window.read_size;
 }
 
+// available_in_window returns how many bytes of the aligned window actually
+// exist in a data file of the given size.
+//
+// The aligned window can run past the end of a volume .dat file: the file ends
+// exactly at the last needle's last byte, and rounding the window up to a 512
+// byte boundary then asks for more. The bytes past EOF are never part of the
+// payload, so they must be tolerated rather than treated as a short read.
+inline int64_t available_in_window(const AlignedWindow& window, int64_t file_size) {
+  if (window.read_size <= 0) {
+    return 0;
+  }
+  int64_t end = window.read_offset + window.read_size;
+  if (file_size < end) {
+    end = file_size;
+  }
+  const int64_t available = end - window.read_offset;
+  return available > 0 ? available : 0;
+}
+
+// payload_within_available reports whether every payload byte is inside the
+// part of the window that exists in the file. A false result means the needle
+// itself is truncated and the request must fail.
+inline bool payload_within_available(const AlignedWindow& window, int64_t data_size,
+                                     int64_t available) {
+  return window.payload_shift >= 0 && window.payload_shift + data_size <= available;
+}
+
 // software_sum_payload is the host-side reference model of the v2 FPGA kernel:
 // pack bytes [payload_shift, payload_shift + payload_size) into little-endian
 // uint64 words and add up the words.

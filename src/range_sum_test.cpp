@@ -186,6 +186,31 @@ int main() {
     }
   }
 
+  // 7. The rounded window can run past EOF: a volume .dat file ends exactly at
+  //    the last needle's last byte. Trailing bytes past EOF are never part of
+  //    the payload and must not be mistaken for a short read, but a payload that
+  //    itself runs past EOF must still fail.
+  {
+    const int64_t file_size = 4116;  // 20-byte needle head + 4096 payload
+    const csd::AlignedWindow window =
+        csd::plan_aligned_window(20, 4096, csd::kReadAlignment);
+    check(window.read_offset + window.read_size > file_size,
+          "expected the rounded window to run past EOF for this layout");
+
+    const int64_t available = csd::available_in_window(window, file_size);
+    check(available == file_size,
+          "available bytes should stop at EOF, got " + std::to_string(available));
+    check(csd::payload_within_available(window, 4096, available),
+          "a payload that fits inside the file must not be reported as truncated");
+    check(!csd::payload_within_available(window, 4097, available),
+          "a payload that runs past EOF must be reported as truncated");
+
+    const csd::AlignedWindow past_eof =
+        csd::plan_aligned_window(4096, 4096, csd::kReadAlignment);
+    check(csd::available_in_window(past_eof, 1024) == 0,
+          "a window entirely past EOF has no available bytes");
+  }
+
   if (failures == 0) {
     std::printf("range_sum_test: all %d checks passed\n", checks);
     return 0;
