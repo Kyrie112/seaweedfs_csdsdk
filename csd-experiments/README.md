@@ -20,6 +20,10 @@ csd-experiments/
 
 ## 内容索引
 
+### 规划
+
+- [ROADMAP.md](ROADMAP.md):后续工作计划(阶段一机制修复 / 阶段二调度模型 / 阶段三算子与实验)
+
 ### 创新点
 
 - [INNOVATIONS.md](INNOVATIONS.md)
