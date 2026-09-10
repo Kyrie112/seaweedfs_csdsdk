@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"sort"
-	"sync"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -26,64 +24,26 @@ type csdReplicaCapability struct {
 	CSDEnabled     bool
 	CSDEndpoint    string
 	ProbeLatencyMs int64
-	Inflight       int64
 	ProbedAt       time.Time
 	ProbeErr       error
 }
 
 // rankComputeReplicas returns volume URLs ordered for compute execution:
-// CSD-capable replicas first, then lower probe latency, then lexicographic
-// host as a deterministic tie-breaker.
+// CSD-capable replicas first, then least in-flight bytes, then fewest in-flight
+// requests, then lower probe latency, then lexicographic host as a deterministic
+// tie-breaker.
+//
+// Capability probing happens outside csdSchedMu (see probeReplicaCapabilities);
+// only the in-memory load snapshot is read under the lock, so a slow
+// /compute/status probe can no longer serialize concurrent chunk fan-out.
 func (fs *FilerServer) rankComputeReplicas(ctx context.Context, urlStrings []string) []string {
-	type capResult struct {
-		index int
-		cap   csdReplicaCapability
-	}
-	results := make([]capResult, len(urlStrings))
-	sem := make(chan struct{}, csdProbeConcurrency)
-	var wg sync.WaitGroup
-	for i, raw := range urlStrings {
-		wg.Add(1)
-		go func(idx int, raw string) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			u, err := url.Parse(raw)
-			if err != nil {
-				results[idx] = capResult{idx, csdReplicaCapability{BaseURL: raw, ProbeErr: err}}
-				return
-			}
-			cap := fs.computeReplicaCapability(ctx, u)
-			if fs.csdInflight != nil {
-				cap.Inflight = fs.csdInflight[cap.Host]
-			}
-			results[idx] = capResult{idx, cap}
-		}(i, raw)
-	}
-	wg.Wait()
+	candidates := fs.probeReplicaCapabilities(ctx, urlStrings)
 
-	sort.SliceStable(results, func(i, j int) bool {
-		a, b := results[i].cap, results[j].cap
-		// Hard constraint: CSD-capable replicas always outrank CPU-only ones.
-		if a.CSDEnabled != b.CSDEnabled {
-			return a.CSDEnabled
-		}
-		// Soft constraint 1: minimize filer-side in-flight load.
-		if a.Inflight != b.Inflight {
-			return a.Inflight < b.Inflight
-		}
-		// Soft constraint 2: lower status-probe latency first.
-		if a.ProbeLatencyMs != b.ProbeLatencyMs {
-			return a.ProbeLatencyMs < b.ProbeLatencyMs
-		}
-		// Deterministic tie-breaker for reproducibility.
-		return a.Host < b.Host
-	})
-	ranked := make([]string, 0, len(results))
-	for _, r := range results {
-		ranked = append(ranked, urlStrings[r.index])
-	}
-	return ranked
+	fs.csdSchedMu.Lock()
+	ranked := rankCandidates(candidates, fs.csdLoadOfLocked, nil)
+	fs.csdSchedMu.Unlock()
+
+	return csdCandidateURLs(ranked)
 }
 
 func (fs *FilerServer) computeReplicaCapability(ctx context.Context, base *url.URL) csdReplicaCapability {
@@ -142,34 +102,61 @@ func (fs *FilerServer) probeCSDStatus(ctx context.Context, statusURL string, out
 	return nil
 }
 
-// rankAndReserve picks the current best replica and atomically increments its
-// in-flight count so concurrent fan-out requests spread across the best CSD
-// replicas instead of stampeding onto the first one. The returned release
-// function decrements the count when the compute attempt finishes.
-func (fs *FilerServer) rankAndReserve(ctx context.Context, urlStrings []string) (string, func(), error) {
-	fs.csdSchedMu.Lock()
-	defer fs.csdSchedMu.Unlock()
-	if fs.csdInflight == nil {
-		fs.csdInflight = make(map[string]int64)
+// rankAndReserve picks the current best replica that is not in exclude, and
+// atomically reserves its in-flight accounting so concurrent fan-out requests
+// spread across the best CSD replicas instead of stampeding onto the first one.
+//
+// Capability probing (which may hit the network) happens before csdSchedMu is
+// taken; the critical section only ranks an in-memory snapshot and updates the
+// counters.
+//
+// weightBytes is the payload size of the chunk being dispatched. In-flight load
+// is tracked as bytes rather than request counts so the scheduler reflects real
+// device and link occupancy instead of treating a 64KiB chunk like an 8MiB one.
+//
+// The returned release function must be called when the attempt finishes, on
+// both the success and the failure path.
+func (fs *FilerServer) rankAndReserve(ctx context.Context, urlStrings []string, weightBytes int64, exclude map[string]struct{}) (string, func(), error) {
+	candidates := fs.probeReplicaCapabilities(ctx, urlStrings)
+	if weightBytes <= 0 {
+		weightBytes = 1
 	}
-	ranked := fs.rankComputeReplicas(ctx, urlStrings)
+
+	fs.csdSchedMu.Lock()
+	if fs.csdInflightBytes == nil {
+		fs.csdInflightBytes = make(map[string]int64)
+	}
+	if fs.csdInflightReqs == nil {
+		fs.csdInflightReqs = make(map[string]int64)
+	}
+	ranked := rankCandidates(candidates, fs.csdLoadOfLocked, exclude)
 	if len(ranked) == 0 {
+		fs.csdSchedMu.Unlock()
+		if len(exclude) > 0 {
+			return "", func() {}, fmt.Errorf("no compute replica left after excluding %d failed replica(s)", len(exclude))
+		}
 		return "", func() {}, fmt.Errorf("no rankable compute replica")
 	}
-	u, err := url.Parse(ranked[0])
-	if err != nil {
-		return "", func() {}, err
-	}
-	host := u.Host
-	fs.csdInflight[host]++
+	chosen := ranked[0]
+	fs.csdInflightBytes[chosen.Host] += weightBytes
+	fs.csdInflightReqs[chosen.Host]++
+	fs.csdSchedMu.Unlock()
+
 	var released bool
-	return ranked[0], func() {
+	return chosen.URL, func() {
 		fs.csdSchedMu.Lock()
 		defer fs.csdSchedMu.Unlock()
 		if released {
 			return
 		}
 		released = true
-		fs.csdInflight[host]--
+		fs.csdInflightBytes[chosen.Host] -= weightBytes
+		if fs.csdInflightBytes[chosen.Host] < 0 {
+			fs.csdInflightBytes[chosen.Host] = 0
+		}
+		fs.csdInflightReqs[chosen.Host]--
+		if fs.csdInflightReqs[chosen.Host] < 0 {
+			fs.csdInflightReqs[chosen.Host] = 0
+		}
 	}, nil
 }

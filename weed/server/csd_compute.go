@@ -29,12 +29,42 @@ type csdComputeRequest struct {
 	DataFile  string `json:"data_file"`
 	Offset    int64  `json:"offset"`
 	Size      int64  `json:"size"`
+
+	// Aligned read window (see storage.ComputeAlignedWindow). A device that can
+	// use O_DIRECT reads [ReadOffset, ReadOffset+ReadSize) and skips PayloadShift
+	// bytes before packing the payload. An engine that does not understand these
+	// fields keeps using Offset/Size: still correct, just through the page cache.
+	ReadOffset   int64 `json:"read_offset"`
+	ReadSize     int64 `json:"read_size"`
+	PayloadShift int64 `json:"payload_shift"`
 }
 
 type csdComputeResponse struct {
 	Result string `json:"result"`
 	Error  string `json:"error,omitempty"`
+
+	// Per-stage device timings reported by the agent.
+	ReadMs   int64 `json:"read_ms,omitempty"`
+	KernelMs int64 `json:"kernel_ms,omitempty"`
+	Direct   bool  `json:"direct,omitempty"`
 }
+
+// csdComputeTiming is the device-side cost breakdown of one CSD compute call.
+type csdComputeTiming struct {
+	Direct   bool
+	ReadMs   int64
+	KernelMs int64
+}
+
+// Response headers used to carry device-side timings back through the volume
+// server to the filer. Headers rather than body fields are used so the numeric
+// result in the body stays byte-for-byte unchanged for the cross-chunk
+// aggregator.
+const (
+	csdHeaderDirect   = "X-CSD-Direct"
+	csdHeaderReadMs   = "X-CSD-Read-Ms"
+	csdHeaderKernelMs = "X-CSD-Kernel-Ms"
+)
 
 // csdSupported reports whether the CSD compute path is configured for this
 // volume server.
@@ -97,7 +127,7 @@ func (vs *VolumeServer) tryHandleCSDCompute(
 		return false
 	}
 
-	result, err := vs.callCSDCompute(r.Context(), operation, region)
+	result, timing, err := vs.callCSDCompute(r.Context(), operation, region)
 	if err != nil {
 		glog.Warningf("CSD compute %q volume %d needle %d: %v", operation, volumeId, n.Id, err)
 		return false
@@ -105,15 +135,20 @@ func (vs *VolumeServer) tryHandleCSDCompute(
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.Itoa(len(result)))
+	w.Header().Set(csdHeaderDirect, strconv.FormatBool(timing.Direct))
+	w.Header().Set(csdHeaderReadMs, strconv.FormatInt(timing.ReadMs, 10))
+	w.Header().Set(csdHeaderKernelMs, strconv.FormatInt(timing.KernelMs, 10))
 	if _, err := w.Write(result); err != nil {
 		glog.V(2).Infof("CSD compute response write error: %v", err)
 	}
-	glog.V(1).Infof("CSD compute %q on volume %d needle %d data=%s offset=%d size=%d",
-		operation, volumeId, n.Id, region.DataFile, region.DataOffset, region.DataSize)
+	glog.V(1).Infof("CSD compute %q on volume %d needle %d data=%s offset=%d size=%d read_offset=%d read_size=%d shift=%d direct=%t read_ms=%d kernel_ms=%d",
+		operation, volumeId, n.Id, region.DataFile, region.DataOffset, region.DataSize,
+		region.ReadOffset, region.ReadSize, region.PayloadShift,
+		timing.Direct, timing.ReadMs, timing.KernelMs)
 	return true
 }
 
-func (vs *VolumeServer) callCSDCompute(ctx context.Context, operation string, region storage.NeedleComputeRegion) ([]byte, error) {
+func (vs *VolumeServer) callCSDCompute(ctx context.Context, operation string, region storage.NeedleComputeRegion) ([]byte, csdComputeTiming, error) {
 	timeout := vs.computeConfig.CSDTimeout
 	if timeout <= 0 {
 		timeout = 60 * time.Second
@@ -122,39 +157,47 @@ func (vs *VolumeServer) callCSDCompute(ctx context.Context, operation string, re
 	defer cancel()
 
 	body, err := json.Marshal(csdComputeRequest{
-		Operation: operation,
-		DataFile:  region.DataFile,
-		Offset:    region.DataOffset,
-		Size:      region.DataSize,
+		Operation:    operation,
+		DataFile:     region.DataFile,
+		Offset:       region.DataOffset,
+		Size:         region.DataSize,
+		ReadOffset:   region.ReadOffset,
+		ReadSize:     region.ReadSize,
+		PayloadShift: region.PayloadShift,
 	})
 	if err != nil {
-		return nil, err
+		return nil, csdComputeTiming{}, err
 	}
 	req, err := http.NewRequestWithContext(runCtx, http.MethodPost, vs.computeConfig.CSDEndpoint+csdComputePath, bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return nil, csdComputeTiming{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := util_http.GetGlobalHttpClient().Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("csd agent request: %w", err)
+		return nil, csdComputeTiming{}, fmt.Errorf("csd agent request: %w", err)
 	}
 	defer util_http.CloseResponse(resp)
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return nil, fmt.Errorf("csd agent response: %w", err)
+		return nil, csdComputeTiming{}, fmt.Errorf("csd agent response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("csd agent status %d: %s", resp.StatusCode, string(raw))
+		return nil, csdComputeTiming{}, fmt.Errorf("csd agent status %d: %s", resp.StatusCode, string(raw))
 	}
 	var parsed csdComputeResponse
 	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return nil, fmt.Errorf("csd agent bad json: %w", err)
+		return nil, csdComputeTiming{}, fmt.Errorf("csd agent bad json: %w", err)
 	}
 	if parsed.Error != "" {
-		return nil, errors.New(parsed.Error)
+		return nil, csdComputeTiming{}, errors.New(parsed.Error)
 	}
-	return []byte(parsed.Result), nil
+	timing := csdComputeTiming{
+		Direct:   parsed.Direct,
+		ReadMs:   parsed.ReadMs,
+		KernelMs: parsed.KernelMs,
+	}
+	return []byte(parsed.Result), timing, nil
 }

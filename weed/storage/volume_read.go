@@ -25,6 +25,47 @@ type NeedleComputeRegion struct {
 	DataOffset int64
 	DataSize   int64
 	Cookie     Cookie
+
+	// Aligned read window for O_DIRECT-capable near-storage engines.
+	// DataOffset is needleOffset + NeedleHeaderSize + DataSizeSize (+20) and the
+	// needle payload is not padded, so a device-side O_DIRECT read of
+	// [DataOffset, DataOffset+DataSize) is almost never possible. ReadOffset /
+	// ReadSize describe the enclosing aligned window that the device can read
+	// with O_DIRECT, and PayloadShift is how many leading bytes of that window
+	// belong to the needle header or to the preceding needle.
+	ReadOffset   int64
+	ReadSize     int64
+	PayloadShift int64
+}
+
+// CSDReadAlignment is the read granularity a near-storage engine needs in order
+// to use O_DIRECT on a volume data file. 512 bytes matches the logical block
+// size of the NVMe devices used in this work.
+const CSDReadAlignment = 512
+
+// ComputeAlignedWindow returns the smallest CSDReadAlignment-aligned window
+// [readOffset, readOffset+readSize) that fully contains the payload range
+// [dataOffset, dataOffset+dataSize), together with the payload byte shift inside
+// that window.
+//
+// A device that reads the aligned window must skip payloadShift bytes before
+// packing the payload, otherwise the uint64 packing alignment of the sum would
+// change and the result would silently differ from a payload-aligned read.
+func ComputeAlignedWindow(dataOffset, dataSize int64) (readOffset, readSize, payloadShift int64) {
+	if dataSize <= 0 {
+		return dataOffset, 0, 0
+	}
+	payloadShift = dataOffset % CSDReadAlignment
+	if payloadShift < 0 {
+		payloadShift += CSDReadAlignment
+	}
+	readOffset = dataOffset - payloadShift
+	span := payloadShift + dataSize
+	readSize = span
+	if remainder := span % CSDReadAlignment; remainder != 0 {
+		readSize = span + (CSDReadAlignment - remainder)
+	}
+	return readOffset, readSize, payloadShift
 }
 
 // NeedleComputeRegion resolves the payload range for needle n without reading
@@ -79,6 +120,8 @@ func (v *Volume) NeedleComputeRegion(n *needle.Needle) (region NeedleComputeRegi
 		DataSize:   int64(n.DataSize),
 		Cookie:     n.Cookie,
 	}
+	region.ReadOffset, region.ReadSize, region.PayloadShift =
+		ComputeAlignedWindow(region.DataOffset, region.DataSize)
 	return region, true, nil
 }
 

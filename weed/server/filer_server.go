@@ -158,10 +158,19 @@ type FilerServer struct {
 	csdMu    sync.RWMutex
 	csdCache map[string]csdReplicaCapability
 
-	// csdSchedMu serializes rank+reserve so concurrent chunk fan-out cannot
-	// choose the same replica before in-flight counts are updated.
-	csdSchedMu  sync.Mutex
-	csdInflight map[string]int64
+	// csdSchedMu guards the in-flight load counters below. It is deliberately
+	// only held for ranking an in-memory snapshot and reserving the chosen
+	// replica: capability probing (which performs network I/O) happens before
+	// the lock is taken, so chunk fan-out is never serialized by a slow probe.
+	csdSchedMu sync.Mutex
+	// csdInflightBytes is the byte-weighted in-flight load per replica host.
+	// Bytes rather than request counts are the primary load signal because
+	// chunks differ by orders of magnitude in size.
+	csdInflightBytes map[string]int64
+	// csdInflightReqs is the request-count view of the same load, used as the
+	// secondary signal so small-request device overhead still influences
+	// placement when byte loads tie.
+	csdInflightReqs map[string]int64
 }
 
 func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption) (fs *FilerServer, err error) {
@@ -204,7 +213,8 @@ func NewFilerServer(defaultMux, readonlyMux *http.ServeMux, option *FilerOption)
 		entryLockTable:        util.NewLockTable[util.FullPath](),
 		posixLocks:            posixlock.NewManager(),
 		csdCache:              make(map[string]csdReplicaCapability),
-		csdInflight:           make(map[string]int64),
+		csdInflightBytes:      make(map[string]int64),
+		csdInflightReqs:       make(map[string]int64),
 	}
 	fs.startPosixLockSweeper()
 	fs.mountPeerRegistry = filer.NewMountPeerRegistry()

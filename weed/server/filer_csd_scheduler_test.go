@@ -71,8 +71,9 @@ func TestRankComputeReplicasPrefersLessLoaded(t *testing.T) {
 	defer idle.Close()
 
 	fs := &FilerServer{
-		csdCache:    make(map[string]csdReplicaCapability),
-		csdInflight: map[string]int64{busy.URL: 5},
+		csdCache:         make(map[string]csdReplicaCapability),
+		csdInflightBytes: map[string]int64{csdHostOf(busy.URL): 5},
+		csdInflightReqs:  make(map[string]int64),
 	}
 	ranked := fs.rankComputeReplicas(context.Background(), []string{busy.URL, idle.URL})
 	if ranked[0] != idle.URL {
@@ -91,14 +92,15 @@ func TestRankAndReserveIncrementsInflight(t *testing.T) {
 	defer two.Close()
 
 	fs := &FilerServer{
-		csdCache:    make(map[string]csdReplicaCapability),
-		csdInflight: make(map[string]int64),
+		csdCache:         make(map[string]csdReplicaCapability),
+		csdInflightBytes: make(map[string]int64),
+		csdInflightReqs:  make(map[string]int64),
 	}
-	first, releaseFirst, err := fs.rankAndReserve(context.Background(), []string{one.URL, two.URL})
+	first, releaseFirst, err := fs.rankAndReserve(context.Background(), []string{one.URL, two.URL}, 4096, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, _, err := fs.rankAndReserve(context.Background(), []string{one.URL, two.URL})
+	second, _, err := fs.rankAndReserve(context.Background(), []string{one.URL, two.URL}, 4096, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +108,7 @@ func TestRankAndReserveIncrementsInflight(t *testing.T) {
 		t.Fatalf("rankAndReserve selected the same replica twice: %s", first)
 	}
 	releaseFirst()
-	third, _, err := fs.rankAndReserve(context.Background(), []string{one.URL, two.URL})
+	third, _, err := fs.rankAndReserve(context.Background(), []string{one.URL, two.URL}, 4096, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
