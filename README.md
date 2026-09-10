@@ -164,3 +164,28 @@ cp _x.hw/file_sum64.link.xclbin file_sum64.xclbin
   并累计 `direct_hits / direct_misses / short_reads`,可直接用于证明 O_DIRECT 是否生效;
 - 响应体新增 `read_ms` / `kernel_ms` / `direct` 字段,
   SeaweedFS volume 侧转成 `X-CSD-Read-Ms` 等响应头,供 filer 汇总分阶段耗时。
+
+## 自适应数据通路选择(V7)
+
+冷数据下 O_DIRECT 更快(省掉「磁盘→页缓存→缓冲区」的第二次拷贝),
+但数据已在页缓存时 O_DIRECT 明显更慢——实测热场景 168ms vs 27ms。
+因此 agent 支持按请求感知缓存并选择路径:
+
+```bash
+./build/csd_agent --xclbin=file_sum64.xclbin --listen=127.0.0.1:18090 \
+  --cache-policy=auto      # auto(默认) | direct | buffered
+```
+
+- `auto`:先用 `preadv2(RWF_NOWAIT)` 尝试读对齐窗口。**完整成功说明数据已在页缓存,
+  而且这次 syscall 本身就是数据搬运**,没有额外开销;`EAGAIN` 或短读(部分命中)
+  则丢弃结果、回退到 O_DIRECT 整窗重读。预测失败只会退化为原路径,不会让请求失败。
+- `direct`:始终 O_DIRECT(修复后的原行为)。
+- `buffered`:始终走页缓存读。
+
+计数器 `cache_hits / cache_partial / cache_misses / probe_errors` 随审计日志输出,
+读路径经响应字段 `path` 透传到 SeaweedFS 的 `X-CSD-Path` / `X-Compute-Cache-Hits`。
+
+**注意(实测结论)**:O_DIRECT 读不填充页缓存,所以如果 compute 路径是文件唯一的
+读者,`auto` 会一直命中失败、退化成 `direct`。自适应的收益依赖数据也被普通读路径
+(FUSE / S3 / 副本复制)访问过。若负载是反复计算同一区间且只经过 compute 路径,
+需要额外机制(首次访问「种」缓存、或按热度周期性回退到缓冲读)并权衡缓存污染。

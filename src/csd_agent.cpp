@@ -21,10 +21,13 @@
 #include <netdb.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -53,6 +56,39 @@ namespace {
 constexpr int kKernelArgsV1 = 3;
 constexpr int kKernelArgsV2 = 5;
 
+// RWF_NOWAIT is defined in <linux/fs.h>, which this file does not include; the
+// value is part of the stable uapi.
+#ifndef RWF_NOWAIT
+#define RWF_NOWAIT 0x00000008
+#endif
+
+// Which read path the agent uses for the payload window.
+enum class CachePolicy {
+  Direct,    // always O_DIRECT
+  Buffered,  // always page-cache reads
+  Auto,      // probe the page cache, use it on a hit, else O_DIRECT
+};
+
+// Reads len bytes into buf at offset only if the range is already resident in
+// the page cache. Returns the number of bytes available without blocking, or -1
+// with errno set (EAGAIN = not cached, ENOSYS = kernel too old).
+ssize_t try_nowait_read(int fd, void* buf, size_t len, int64_t offset) {
+#if defined(SYS_preadv2)
+  struct iovec iov {};
+  iov.iov_base = buf;
+  iov.iov_len = len;
+  return static_cast<ssize_t>(::syscall(SYS_preadv2, fd, &iov, 1,
+                                        static_cast<off_t>(offset), RWF_NOWAIT));
+#else
+  (void)fd;
+  (void)buf;
+  (void)len;
+  (void)offset;
+  errno = ENOSYS;
+  return -1;
+#endif
+}
+
 int64_t elapsed_ms(const std::chrono::steady_clock::time_point& start) {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
              std::chrono::steady_clock::now() - start)
@@ -68,6 +104,12 @@ struct AgentStats {
   uint64_t short_reads = 0;
   uint64_t legacy_paths = 0;
   uint64_t window_mismatches = 0;
+  // Adaptive-path counters: hits are requests served from the page cache,
+  // misses/partials are the ones that fell back to O_DIRECT.
+  uint64_t cache_hits = 0;
+  uint64_t cache_partial = 0;
+  uint64_t cache_misses = 0;
+  uint64_t probe_errors = 0;
 };
 
 struct ComputeOutcome {
@@ -77,9 +119,11 @@ struct ComputeOutcome {
   int64_t payload_shift = 0;
   int64_t read_bytes = 0;
   int64_t read_ms = 0;
+  int64_t probe_ms = 0;
   int64_t kernel_ms = 0;
   bool direct = false;
   bool aligned_kernel = false;
+  std::string path;
 };
 
 template <typename T>
@@ -237,6 +281,8 @@ class OpenClRuntime {
 
   int kernel_arg_count() const { return kernel_arg_count_; }
   const AgentStats& stats() const { return stats_; }
+  void set_cache_policy(CachePolicy policy) { cache_policy_ = policy; }
+  CachePolicy cache_policy() const { return cache_policy_; }
 
   // Runs one compute request and reports the device-side cost breakdown.
   ComputeOutcome sum_range(const ComputeRequest& req) {
@@ -279,6 +325,7 @@ class OpenClRuntime {
     if (!outcome.aligned_kernel) {
       ++stats_.legacy_paths;
       window = csd::AlignedWindow{req.offset, req.size, 0};
+      outcome.path = "legacy";
     }
     outcome.read_offset = window.read_offset;
     outcome.read_size = window.read_size;
@@ -361,9 +408,35 @@ class OpenClRuntime {
       ++stats_.direct_misses;
     }
 
+    // Adaptive data path selection. A successful RWF_NOWAIT probe is not a
+    // wasted round trip: the bytes land in the destination buffer, so a cache
+    // hit costs one memcpy instead of a device read. A miss (EAGAIN) or a
+    // partial hit falls back to the O_DIRECT window read below.
+    bool served_from_cache = false;
+    if (cache_policy_ == CachePolicy::Auto) {
+      const auto probe_start = std::chrono::steady_clock::now();
+      const ssize_t probed = try_nowait_read(fd, p2p, static_cast<size_t>(available),
+                                             window.read_offset);
+      const int probe_errno = errno;
+      outcome.probe_ms = elapsed_ms(probe_start);
+      if (probed == static_cast<ssize_t>(available)) {
+        served_from_cache = true;
+        ++stats_.cache_hits;
+      } else if (probed >= 0) {
+        ++stats_.cache_partial;
+      } else if (probe_errno == EAGAIN) {
+        ++stats_.cache_misses;
+      } else {
+        ++stats_.probe_errors;
+      }
+    }
+
     const auto read_start = std::chrono::steady_clock::now();
     ssize_t got = 0;
-    if (outcome.direct) {
+    if (served_from_cache) {
+      outcome.path = "cache";
+      got = static_cast<ssize_t>(available);
+    } else if (outcome.direct) {
       got = csd::read_fully_at(fd_direct, p2p, static_cast<size_t>(direct_len),
                                window.read_offset);
       if (got == direct_len && available > direct_len) {
@@ -375,6 +448,9 @@ class OpenClRuntime {
     } else {
       got = csd::read_fully_at(fd, p2p, static_cast<size_t>(available),
                                window.read_offset);
+    }
+    if (outcome.path.empty()) {
+      outcome.path = outcome.direct ? "direct" : "buffered";
     }
     outcome.read_ms = elapsed_ms(read_start);
     outcome.read_bytes = got;
@@ -426,6 +502,7 @@ class OpenClRuntime {
   std::unique_ptr<cl::CommandQueue> queue_;
   std::unique_ptr<cl::Program> program_;
   int kernel_arg_count_ = 0;
+  CachePolicy cache_policy_ = CachePolicy::Auto;
   AgentStats stats_;
 };
 
@@ -511,6 +588,8 @@ void handle_client(int client_fd, OpenClRuntime& runtime) {
                  << ",\"read_ms\":" << outcome.read_ms
                  << ",\"kernel_ms\":" << outcome.kernel_ms
                  << ",\"direct\":" << (outcome.direct ? "true" : "false")
+                 << ",\"path\":\"" << outcome.path << "\""
+                 << ",\"probe_ms\":" << outcome.probe_ms
                  << ",\"aligned_kernel\":"
                  << (outcome.aligned_kernel ? "true" : "false") << "}";
         const AgentStats& stats = runtime.stats();
@@ -519,13 +598,18 @@ void handle_client(int client_fd, OpenClRuntime& runtime) {
                   << (outcome.read_offset + outcome.read_size) << ")"
                   << " shift=" << outcome.payload_shift
                   << " kernel=" << (outcome.aligned_kernel ? "v2" : "v1")
+                  << " path=" << outcome.path
                   << " direct=" << (outcome.direct ? "yes" : "no")
+                  << " probe_ms=" << outcome.probe_ms
                   << " read_bytes=" << outcome.read_bytes
                   << " read_ms=" << outcome.read_ms
                   << " kernel_ms=" << outcome.kernel_ms
                   << " direct_hits=" << stats.direct_hits
                   << " direct_misses=" << stats.direct_misses
-                  << " short_reads=" << stats.short_reads << "\n";
+                  << " short_reads=" << stats.short_reads
+                  << " cache_hits=" << stats.cache_hits
+                  << " cache_misses=" << stats.cache_misses
+                  << " cache_partial=" << stats.cache_partial << "\n";
         respond(client_fd, 200, response.str());
       } catch (const std::exception& e) {
         respond(client_fd, 500, "{\"error\":\"" + std::string(e.what()) + "\"}");
@@ -543,14 +627,18 @@ void handle_client(int client_fd, OpenClRuntime& runtime) {
 int main(int argc, char** argv) {
   std::string xclbin;
   std::string listen = "127.0.0.1:18090";
+  std::string cache_policy = "auto";
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg.rfind("--xclbin=", 0) == 0) {
       xclbin = arg.substr(9);
     } else if (arg.rfind("--listen=", 0) == 0) {
       listen = arg.substr(9);
+    } else if (arg.rfind("--cache-policy=", 0) == 0) {
+      cache_policy = arg.substr(15);
     } else {
-      std::cerr << "usage: csd_agent --xclbin=<file> [--listen=ip:port]\n";
+      std::cerr << "usage: csd_agent --xclbin=<file> [--listen=ip:port]"
+                   " [--cache-policy=auto|direct|buffered]\n";
       return 2;
     }
   }
@@ -561,6 +649,18 @@ int main(int argc, char** argv) {
 
   try {
     OpenClRuntime runtime(xclbin);
+    if (cache_policy == "direct") {
+      runtime.set_cache_policy(CachePolicy::Direct);
+    } else if (cache_policy == "buffered") {
+      runtime.set_cache_policy(CachePolicy::Buffered);
+    } else if (cache_policy == "auto") {
+      runtime.set_cache_policy(CachePolicy::Auto);
+    } else {
+      std::cerr << "unknown --cache-policy=" << cache_policy
+                << " (want auto, direct or buffered)\n";
+      return 2;
+    }
+    std::cerr << "csd_agent: cache policy=" << cache_policy << "\n";
     std::cerr << "csd_agent: file_sum64 args=" << runtime.kernel_arg_count()
               << " ("
               << (runtime.kernel_arg_count() == kKernelArgsV2
