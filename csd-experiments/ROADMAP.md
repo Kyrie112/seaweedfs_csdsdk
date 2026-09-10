@@ -108,12 +108,14 @@ filer 记录每 chunk 与整请求的 dispatch/总耗时,并在日志中输出�
 
 ### 阶段一验收清单
 
-- [ ] P1-1 对齐读路径与内核 v2(含兼容回退)
-- [ ] P1-2 短读/部分读校验
-- [ ] P1-3 锁粒度、failover 排除集、字节加权负载
-- [ ] P1-4 分阶段耗时导出
-- [ ] Go 单元测试与 `go build ./weed/...` 通过
-- [ ] 主机侧参考模型测试通过(等价性证明)
+实施与验证结果见 [reports/REPORT_PHASE1_HARDENING.md](reports/REPORT_PHASE1_HARDENING.md)。
+
+- [x] P1-1 对齐读路径与内核 v2(含兼容回退)
+- [x] P1-2 短读/部分读校验
+- [x] P1-3 锁粒度、failover 排除集、字节加权负载
+- [x] P1-4 分阶段耗时导出
+- [x] Go 单元测试与 `go build ./weed/server/ ./weed/storage/` 通过
+- [x] 主机侧参考模型测试通过(等价性证明,354 项检查)
 - [ ] 真机 xclbin 重合成与端到端实测(需 .9 机器,阶段一收尾)
 
 ## 4. 阶段二(3–4 周):从启发式调度到调度模型

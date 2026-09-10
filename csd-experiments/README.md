@@ -30,6 +30,7 @@ csd-experiments/
 
 ### 报告(reports/)
 
+- [REPORT_PHASE1_HARDENING.md](reports/REPORT_PHASE1_HARDENING.md):阶段一(P2P 对齐通路 / 短读校验 / 调度加固)实施与验证
 - [REPORT.md](reports/REPORT.md):主机计算 vs 计算下沉全网格实验
 - [REPORT_CROSS_CHUNK.md](reports/REPORT_CROSS_CHUNK.md):跨 chunk 计算实现与验证
 - [REPORT_MULTIMODAL_INTERFACE.md](reports/REPORT_MULTIMODAL_INTERFACE.md):多模态接口
