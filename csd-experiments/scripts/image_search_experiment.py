@@ -34,7 +34,16 @@ def http_get(url, timeout=600):
     return body, headers, (time.perf_counter() - started) * 1000.0
 
 
-def upload_file(path, url):
+def upload_file(path, url, content_type="application/octet-stream"):
+    """Upload a file to the filer.
+
+    The content type matters: SeaweedFS decides whether to gzip a needle from
+    the MIME type and from a 128-byte compression sample. Raw image payloads
+    must be stored uncompressed, otherwise the needle is compressed and the CSD
+    path rejects it (compressed needles are not yet supported by the device
+    operator). Declaring an image/* type tells the storage layer that the data
+    is already an image format and must not be gzipped.
+    """
     boundary = "----csdimgsearchboundary"
     with open(path, "rb") as handle:
         payload = handle.read()
@@ -42,7 +51,7 @@ def upload_file(path, url):
         ("--%s\r\n" % boundary).encode(),
         ('Content-Disposition: form-data; name="file"; filename="%s"\r\n'
          % os.path.basename(path)).encode(),
-        b"Content-Type: application/octet-stream\r\n\r\n",
+        ("Content-Type: %s\r\n\r\n" % content_type).encode(),
         payload,
         ("\r\n--%s--\r\n" % boundary).encode(),
     ])

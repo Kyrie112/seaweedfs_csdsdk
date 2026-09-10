@@ -14,7 +14,7 @@
 
 #define IMAGE_SIDE 64
 #define IMAGE_RECORD_BYTES (IMAGE_SIDE * IMAGE_SIDE)
-#define DESCRIPTOR_DIMS 68
+#define DESCRIPTOR_DIMS 64
 #define IMGTOPK_MAX_K 64
 
 extern "C" {
@@ -62,14 +62,13 @@ record_loop:
 
   pixel_loop:
     for (int y = 0; y < IMAGE_SIDE; ++y) {
+      const int row = (y / 8) * 8;
     pixel_inner:
       for (int x = 0; x < IMAGE_SIDE; ++x) {
 #pragma HLS PIPELINE II=1
-        const int value = record[y * IMAGE_SIDE + x];
-        descriptor[value >> 2] += 1;
-        const int quadrant = ((y >= IMAGE_SIDE / 2) ? 2 : 0) +
-                             ((x >= IMAGE_SIDE / 2) ? 1 : 0);
-        descriptor[64 + quadrant] += value;
+        // Each cell accumulates an 8x8 pixel block: the descriptor keeps
+        // coarse shape while staying a single-pass integer computation.
+        descriptor[row + x / 8] += record[y * IMAGE_SIDE + x];
       }
     }
 

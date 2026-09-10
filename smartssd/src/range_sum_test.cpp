@@ -254,15 +254,13 @@ int main() {
     int32_t descriptor[csd::kDescriptorDims];
 
     csd::image_descriptor(black.data(), descriptor);
-    check(descriptor[0] == csd::kImageRecordSize, "black image: histogram bin 0");
-    for (int i = 64; i < csd::kDescriptorDims; ++i) {
-      check(descriptor[i] == 0, "black image: quadrant sums are zero");
+    for (int i = 0; i < csd::kDescriptorDims; ++i) {
+      check(descriptor[i] == 0, "black image: every grid cell is zero");
     }
 
     csd::image_descriptor(white.data(), descriptor);
-    check(descriptor[63] == csd::kImageRecordSize, "white image: histogram bin 63");
-    for (int i = 64; i < csd::kDescriptorDims; ++i) {
-      check(descriptor[i] == 32 * 32 * 255, "white image: quadrant sum");
+    for (int i = 0; i < csd::kDescriptorDims; ++i) {
+      check(descriptor[i] == 8 * 8 * 255, "white image: every grid cell is 8*8*255");
     }
     int32_t black_descriptor[csd::kDescriptorDims];
     int32_t white_descriptor[csd::kDescriptorDims];

@@ -4,8 +4,7 @@
 // descriptor is integer-only on purpose so an FPGA kernel can build it in a
 // single streaming pass over the record:
 //
-//   descriptor[0..63]  intensity histogram, bin = pixel >> 2
-//   descriptor[64..67] sum of pixel values in each of the four quadrants
+//   descriptor[g] = sum of pixel values in the 8x8 cell g of an 8x8 grid
 //
 // Similarity is the L1 distance between descriptors (smaller is closer).
 // This header is free of XRT/OpenCL dependencies so it can be unit tested on
@@ -24,26 +23,17 @@ namespace csd {
 
 constexpr int kImageSide = 64;
 constexpr int kImageRecordSize = kImageSide * kImageSide;  // 4096 bytes
-constexpr int kDescriptorDims = 68;
+constexpr int kDescriptorDims = 64;
 
 // image_descriptor computes the descriptor of one record.
 inline void image_descriptor(const uint8_t* record, int32_t* out) {
   for (int i = 0; i < kDescriptorDims; ++i) {
     out[i] = 0;
   }
-  const int half = kImageSide / 2;
   for (int y = 0; y < kImageSide; ++y) {
+    const int row = (y / 8) * 8;
     for (int x = 0; x < kImageSide; ++x) {
-      const int value = record[y * kImageSide + x];
-      out[value >> 2] += 1;
-      int quadrant = 0;
-      if (y >= half) {
-        quadrant += 2;
-      }
-      if (x >= half) {
-        quadrant += 1;
-      }
-      out[64 + quadrant] += value;
+      out[row + x / 8] += record[y * kImageSide + x];
     }
   }
 }

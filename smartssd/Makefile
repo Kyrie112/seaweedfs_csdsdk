@@ -16,7 +16,7 @@ build/csd_agent: src/csd_agent.cpp src/aligned_range.h | build
 # reading the enclosing 512B-aligned window and skipping payload_shift bytes
 # gives bit-identical results to a payload-aligned read, which is the property
 # the v2 kernel relies on.
-build/range_sum_test: src/range_sum_test.cpp src/aligned_range.h | build
+build/range_sum_test: src/range_sum_test.cpp src/aligned_range.h src/image_topk.h | build
 	$(CXX) $(CXXFLAGS) -o $@ src/range_sum_test.cpp
 
 test: build/range_sum_test

@@ -32,7 +32,10 @@ csd-experiments/
 - [tools/csd-agent-sim](tools/csd-agent-sim):无 FPGA 的软件 CSD agent(同协议、同语义)
 - [scripts/run_phase1_local.sh](scripts/run_phase1_local.sh):本地部署 + 读路径/自适应策略性能实验
 - [scripts/run_image_search_experiment.sh](scripts/run_image_search_experiment.sh):近存以图搜图(top-k)实验
-  (图库规模/k 可参数化,内置暴力检索参考实现与传输量对比)
+  (图库规模/k 可参数化,内置暴力检索参考实现与传输量对比;
+  `SCRIPT=image_search_mnist_experiment.py` 可切换到真实数据集 MNIST)
+- [scripts/make_figures.py](scripts/make_figures.py):从结果 CSV 重绘论文图表(Pillow)
+- [results/figures/](results/figures):论文图 6-1 ~ 6-7
   (`MODES="direct auto"` 可跑自适应缓存策略对比)
 
 ### 创新点

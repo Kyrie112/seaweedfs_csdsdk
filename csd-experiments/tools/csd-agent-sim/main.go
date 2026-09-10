@@ -62,14 +62,13 @@ const alignment = 512
 // device descriptor is deliberately integer-only so an FPGA kernel can compute
 // it with a single streaming pass:
 //
-//	descriptor[0..63]  intensity histogram, bin = pixel >> 2
-//	descriptor[64..67] sum of pixel values in each of the four quadrants
+//	descriptor[g] = sum of pixel values in the 8x8 cell g of an 8x8 grid
 //
 // Similarity is the L1 distance between descriptors; smaller is closer.
 const (
 	imgTopKOperation  = "img_topk"
 	defaultRecordSize = 64 * 64 // 64x64 grayscale thumbnail
-	descriptorDims    = 64 + 4
+	descriptorDims    = 64
 	imageSide         = 64
 )
 
@@ -202,19 +201,10 @@ func readFullyAt(fd int, buf []byte, offset int64) (int, error) {
 // imageDescriptor mirrors the descriptor computation of the device kernel.
 func imageDescriptor(record []byte) [descriptorDims]int64 {
 	var d [descriptorDims]int64
-	const half = imageSide / 2
 	for y := 0; y < imageSide; y++ {
+		row := (y / 8) * 8
 		for x := 0; x < imageSide; x++ {
-			value := int64(record[y*imageSide+x])
-			d[value>>2]++
-			quadrant := 0
-			if y >= half {
-				quadrant += 2
-			}
-			if x >= half {
-				quadrant++
-			}
-			d[64+quadrant] += value
+			d[row+x/8] += int64(record[y*imageSide+x])
 		}
 	}
 	return d

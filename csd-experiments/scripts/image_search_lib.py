@@ -12,20 +12,25 @@ import struct
 
 IMAGE_SIDE = 64
 RECORD_SIZE = IMAGE_SIDE * IMAGE_SIDE  # 4096 bytes, 64x64 grayscale
-DESCRIPTOR_DIMS = 68  # 64 histogram bins + 4 quadrant sums
+DESCRIPTOR_DIMS = 64  # 8x8 grid of cell sums ("tiny image" descriptor)
 
 
 def descriptor(record):
-    """Integer-only descriptor: 64 histogram bins + 4 quadrant sums."""
+    """Integer-only descriptor: an 8x8 grid of cell sums.
+
+    Each cell covers an 8x8 pixel block, so descriptor[g] is the sum of the 64
+    pixel values in that block. The whole descriptor is built in a single
+    streaming pass with 64 integer accumulators, which maps directly onto an
+    FPGA pipeline, yet it preserves coarse shape information - unlike a global
+    intensity histogram, which was measured to have almost no discriminative
+    power on real images (see the descriptor comparison in the experiment).
+    """
     d = [0] * DESCRIPTOR_DIMS
-    half = IMAGE_SIDE // 2
     for y in range(IMAGE_SIDE):
         base = y * IMAGE_SIDE
+        row = (y // 8) * 8
         for x in range(IMAGE_SIDE):
-            v = record[base + x]
-            d[v >> 2] += 1
-            q = (1 if x >= half else 0) + (2 if y >= half else 0)
-            d[64 + q] += v
+            d[row + x // 8] += record[base + x]
     return d
 
 

@@ -12,6 +12,8 @@ WORK=${WORK:-/tmp/csd-imgsearch}
 CSV=${CSV:-$(cd "$(dirname "$0")/.." && pwd)/results/image_search.csv}
 IMAGES=${1:-4096}
 K=${2:-5}
+SCRIPT=${SCRIPT:-image_search_experiment.py}
+EXTRA=${EXTRA:-}
 REPS=${REPS:-7}
 READ_MODE=${READ_MODE:-direct}
 
@@ -78,9 +80,9 @@ AGENT_PID=$!
 wait_http "$AGENT_URL/v1/stats" 15 || { log "agent failed"; cat "$WORK/agent.log"; exit 1; }
 
 log "running experiment (images=$IMAGES k=$K read_mode=$READ_MODE)"
-python3 "$(dirname "$0")/image_search_experiment.py" \
+python3 "$(dirname "$0")/$SCRIPT" \
     --filer="http://127.0.0.1:${FILER_PORT}" \
-    --work="$WORK" --images="$IMAGES" --k="$K" --reps="$REPS" --csv="$CSV"
+    --work="$WORK" --images="$IMAGES" --k="$K" --reps="$REPS" --csv="$CSV" $EXTRA
 status=$?
 log "experiment finished with status $status"
 exit $status
