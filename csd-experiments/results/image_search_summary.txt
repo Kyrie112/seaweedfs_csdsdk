@@ -1,0 +1,13 @@
+Near-storage image similarity search (top-k), local deployment
+gallery = concatenated 64x64 grayscale thumbnails (4096 B per image), 8 visual clusters
+baseline = download the whole gallery and search on the client
+
+ images chunks   k   near_ms  bytes_back    base_ms  bytes_xfer  speedup  traffic_saved  top-k  match
+   1024      1   5     21.05          43     901.51     4194304    42.8x       99.9990%   7/7     yes
+   4096      4   1     48.30           9    3602.21    16777216    74.6x       99.9999%   7/7     yes
+   4096      4  20     49.47         196    3632.88    16777216    73.4x       99.9988%   7/7     yes
+  16384     16   5    154.70          53   14387.69    67108864    93.0x       99.9999%   7/7     yes
+   4096      4   5     52.31          48    3582.97    16777216    68.5x       99.9997%   7/7     yes
+
+correctness: the near-storage answer equals a brute-force reference over the same bytes
+             (identical indices and distances) in every run of every configuration

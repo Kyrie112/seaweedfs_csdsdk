@@ -34,6 +34,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -42,6 +43,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -52,6 +55,23 @@ import (
 
 // alignment matches csd::kReadAlignment in src/aligned_range.h.
 const alignment = 512
+
+// Image similarity search operator (mirrors src/image_descriptor.h).
+//
+// The gallery file is a concatenation of fixed-size grayscale thumbnails. The
+// device descriptor is deliberately integer-only so an FPGA kernel can compute
+// it with a single streaming pass:
+//
+//	descriptor[0..63]  intensity histogram, bin = pixel >> 2
+//	descriptor[64..67] sum of pixel values in each of the four quadrants
+//
+// Similarity is the L1 distance between descriptors; smaller is closer.
+const (
+	imgTopKOperation  = "img_topk"
+	defaultRecordSize = 64 * 64 // 64x64 grayscale thumbnail
+	descriptorDims    = 64 + 4
+	imageSide         = 64
+)
 
 type readMode string
 
@@ -75,6 +95,11 @@ type computeRequest struct {
 	ReadOffset   int64  `json:"read_offset"`
 	ReadSize     int64  `json:"read_size"`
 	PayloadShift int64  `json:"payload_shift"`
+
+	// Params carries operator parameters (k, rec, q) forwarded by the volume
+	// server. The payload itself is still addressed by file offset, so a query
+	// descriptor is the only thing the client has to send.
+	Params map[string]string `json:"params,omitempty"`
 }
 
 type computeResponse struct {
@@ -174,6 +199,130 @@ func readFullyAt(fd int, buf []byte, offset int64) (int, error) {
 	return done, nil
 }
 
+// imageDescriptor mirrors the descriptor computation of the device kernel.
+func imageDescriptor(record []byte) [descriptorDims]int64 {
+	var d [descriptorDims]int64
+	const half = imageSide / 2
+	for y := 0; y < imageSide; y++ {
+		for x := 0; x < imageSide; x++ {
+			value := int64(record[y*imageSide+x])
+			d[value>>2]++
+			quadrant := 0
+			if y >= half {
+				quadrant += 2
+			}
+			if x >= half {
+				quadrant++
+			}
+			d[64+quadrant] += value
+		}
+	}
+	return d
+}
+
+func descriptorDistance(a, b *[descriptorDims]int64) int64 {
+	var distance int64
+	for i := 0; i < descriptorDims; i++ {
+		delta := a[i] - b[i]
+		if delta < 0 {
+			delta = -delta
+		}
+		distance += delta
+	}
+	return distance
+}
+
+// decodeQueryDescriptor decodes the little-endian int32 descriptor the client
+// computed from its query image.
+func decodeQueryDescriptor(encoded string) (*[descriptorDims]int64, error) {
+	if encoded == "" {
+		return nil, errors.New("missing query descriptor q")
+	}
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("query descriptor is not base64: %w", err)
+	}
+	if len(raw) != descriptorDims*4 {
+		return nil, fmt.Errorf("query descriptor is %d bytes, want %d", len(raw), descriptorDims*4)
+	}
+	var descriptor [descriptorDims]int64
+	for i := 0; i < descriptorDims; i++ {
+		descriptor[i] = int64(int32(uint32(raw[4*i]) | uint32(raw[4*i+1])<<8 |
+			uint32(raw[4*i+2])<<16 | uint32(raw[4*i+3])<<24))
+	}
+	return &descriptor, nil
+}
+
+// searchTopK scans every *complete* record inside [base, base+size) and returns
+// the local top-k. Skipping a record that straddles the range boundary is what
+// makes the operator safe to run per chunk: the filer only accepts files whose
+// chunks tile the file, so every record is covered exactly once by the chunk
+// that contains it in full.
+func searchTopK(payload []byte, base, size, recordSize int64, query *[descriptorDims]int64, k int) (string, error) {
+	if recordSize <= 0 || recordSize%alignment != 0 {
+		return "", fmt.Errorf("record size %d must be a positive multiple of %d", recordSize, alignment)
+	}
+	end := base + size
+	hits := make([]string, 0, k)
+	distances := make([]int64, 0, k)
+	indices := make([]int64, 0, k)
+
+	for offset := ((base + recordSize - 1) / recordSize) * recordSize; offset+recordSize <= end; offset += recordSize {
+		start := offset - base
+		descriptor := imageDescriptor(payload[start : start+recordSize])
+		distance := descriptorDistance(query, &descriptor)
+		index := offset / recordSize
+
+		if len(indices) == k && (distance > distances[len(distances)-1] ||
+			(distance == distances[len(distances)-1] && index > indices[len(indices)-1])) {
+			continue
+		}
+		position := len(distances)
+		for position > 0 && (distances[position-1] > distance ||
+			(distances[position-1] == distance && indices[position-1] > index)) {
+			position--
+		}
+		distances = append(distances, 0)
+		indices = append(indices, 0)
+		copy(distances[position+1:], distances[position:])
+		copy(indices[position+1:], indices[position:])
+		distances[position] = distance
+		indices[position] = index
+		if len(distances) > k {
+			distances = distances[:k]
+			indices = indices[:k]
+		}
+	}
+	for i := range indices {
+		hits = append(hits, fmt.Sprintf("%d:%d", indices[i], distances[i]))
+	}
+	return strings.Join(hits, ","), nil
+}
+
+func paramInt(params map[string]string, name string, fallback int) int {
+	raw := params[name]
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 {
+		return fallback
+	}
+	return value
+}
+
+func paramInt64(params map[string]string, name string, fallback int64) int64 {
+	raw := params[name]
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value < 0 {
+		return fallback
+	}
+	return value
+}
+
 type agent struct {
 	mode      readMode
 	evict     bool
@@ -205,7 +354,9 @@ func (a *agent) handleCompute(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *agent) run(req computeRequest) (computeResponse, int) {
-	if req.Operation != "rawsum64" && req.Operation != "file_sum64" {
+	switch req.Operation {
+	case "rawsum64", "file_sum64", imgTopKOperation:
+	default:
 		return computeResponse{Error: "unsupported operation " + req.Operation}, http.StatusBadRequest
 	}
 	if req.Size == 0 {
@@ -378,14 +529,37 @@ func (a *agent) run(req computeRequest) (computeResponse, int) {
 	}
 
 	kernelStart := time.Now()
-	sum := sumPayload(buf.slice, w.payloadShift, req.Size)
+	var result string
+	var computeErr error
+	if req.Operation == imgTopKOperation {
+		query, err := decodeQueryDescriptor(req.Params["q"])
+		if err != nil {
+			return computeResponse{Error: err.Error()}, http.StatusBadRequest
+		}
+		// Record indices are logical file coordinates, not physical .dat
+		// offsets: the volume server only knows where the needle lives inside
+		// the data file, while only the filer knows where the chunk lives
+		// inside the file. Mixing the two silently misaligns every record.
+		result, computeErr = searchTopK(
+			buf.slice[w.payloadShift:w.payloadShift+req.Size],
+			paramInt64(req.Params, "base_off", 0), req.Size,
+			int64(paramInt(req.Params, "rec", defaultRecordSize)),
+			query,
+			paramInt(req.Params, "k", 5),
+		)
+	} else {
+		result = fmt.Sprintf("%d", sumPayload(buf.slice, w.payloadShift, req.Size))
+	}
 	kernelMs := time.Since(kernelStart).Milliseconds()
+	if computeErr != nil {
+		return computeResponse{Error: computeErr.Error()}, http.StatusBadRequest
+	}
 
-	log.Printf("compute size=%d window=[%d,%d) shift=%d mode=%s path=%s direct=%v probe_ms=%d read_ms=%d kernel_ms=%d result=%d",
-		req.Size, w.readOffset, w.readOffset+w.readSize, w.payloadShift, a.mode, path, direct, probeMs, readMs, kernelMs, sum)
+	log.Printf("compute op=%s size=%d window=[%d,%d) shift=%d mode=%s path=%s direct=%v probe_ms=%d read_ms=%d kernel_ms=%d result=%s",
+		req.Operation, req.Size, w.readOffset, w.readOffset+w.readSize, w.payloadShift, a.mode, path, direct, probeMs, readMs, kernelMs, result)
 
 	return computeResponse{
-		Result:    fmt.Sprintf("%d", sum),
+		Result:    result,
 		ReadMs:    readMs,
 		KernelMs:  kernelMs,
 		Direct:    direct,

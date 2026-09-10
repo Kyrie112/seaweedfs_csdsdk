@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math/big"
 	"math/rand/v2"
 	"net/http"
 	"net/url"
@@ -160,6 +159,12 @@ func validateChunksCoverFile(chunks []*filer_pb.FileChunk, fileSize int64) error
 		if c.GetOffset() != next {
 			return fmt.Errorf("compute requires contiguous chunks without gaps: chunk offset=%d expected=%d", c.GetOffset(), next)
 		}
+		// Per-chunk results of a packing operator are only congruent with the
+		// whole-file result when no chunk boundary falls inside a packing unit.
+		if size := int64(c.GetSize()); size%computeChunkPackingUnit != 0 {
+			return fmt.Errorf("compute requires chunk sizes to be multiples of %d bytes so per-chunk results stay congruent with the whole-file result: chunk offset=%d size=%d",
+				computeChunkPackingUnit, c.GetOffset(), size)
+		}
 		next = c.GetOffset() + int64(c.GetSize())
 	}
 	if next != fileSize {
@@ -263,7 +268,7 @@ func parseHeaderInt64(value string) int64 {
 func (fs *FilerServer) proxySingleChunkCompute(w http.ResponseWriter, r *http.Request, entry *filer.Entry, chunk *filer_pb.FileChunk, operation string) {
 	ctx := r.Context()
 	fileId := chunk.GetFileIdString()
-	body, timing, err := fs.fetchChunkComputeResult(ctx, r, fileId, entry.Name(), operation, int64(chunk.GetSize()))
+	body, timing, err := fs.fetchChunkComputeResult(ctx, r, fileId, entry.Name(), operation, int64(chunk.GetSize()), chunk.GetOffset())
 	if err != nil {
 		glog.ErrorfCtx(ctx, "compute proxy to volume: %v", err)
 		writeJsonError(w, r, http.StatusInternalServerError, err)
@@ -291,7 +296,7 @@ func (fs *FilerServer) proxySingleChunkCompute(w http.ResponseWriter, r *http.Re
 // guaranteed to target a different replica. Without that set, re-ranking could
 // hand the request straight back to the replica that just failed and failover
 // would be a no-op.
-func (fs *FilerServer) fetchChunkComputeResult(ctx context.Context, r *http.Request, fileId string, filename string, operation string, payloadBytes int64) (body []byte, timing chunkComputeTiming, err error) {
+func (fs *FilerServer) fetchChunkComputeResult(ctx context.Context, r *http.Request, fileId string, filename string, operation string, payloadBytes int64, baseOffset int64) (body []byte, timing chunkComputeTiming, err error) {
 	timing = chunkComputeTiming{FileId: fileId, PayloadBytes: payloadBytes}
 	started := time.Now()
 	defer func() {
@@ -316,7 +321,7 @@ func (fs *FilerServer) fetchChunkComputeResult(ctx context.Context, r *http.Requ
 			}
 			return nil, timing, reserveErr
 		}
-		chunkBody, deviceTiming, fetchErr := fs.fetchFromComputeReplica(ctx, r, fileId, filename, operation, raw)
+		chunkBody, deviceTiming, fetchErr := fs.fetchFromComputeReplica(ctx, r, fileId, filename, operation, raw, baseOffset)
 		release()
 		if fetchErr == nil {
 			timing.Direct = deviceTiming.Direct
@@ -335,7 +340,7 @@ func (fs *FilerServer) fetchChunkComputeResult(ctx context.Context, r *http.Requ
 	return nil, timing, lastErr
 }
 
-func (fs *FilerServer) fetchFromComputeReplica(ctx context.Context, r *http.Request, fileId string, filename string, operation string, replicaURL string) ([]byte, csdComputeTiming, error) {
+func (fs *FilerServer) fetchFromComputeReplica(ctx context.Context, r *http.Request, fileId string, filename string, operation string, replicaURL string, baseOffset int64) ([]byte, csdComputeTiming, error) {
 	var noTiming csdComputeTiming
 	target, err := url.Parse(replicaURL)
 	if err != nil {
@@ -346,6 +351,14 @@ func (fs *FilerServer) fetchFromComputeReplica(ctx context.Context, r *http.Requ
 	}
 	query := r.URL.Query()
 	query.Set(volumeComputeQuery, operation)
+	// The device only knows the physical byte range inside a volume data file.
+	// Operators that carry file-level semantics (record indices, for example)
+	// need the logical position of this chunk inside the file, so the filer -
+	// the only component that sees the whole chunk list - hands it down per
+	// chunk.
+	if operation == imageSearchOperation {
+		query.Set("base_off", strconv.FormatInt(baseOffset, 10))
+	}
 	target.RawQuery = query.Encode()
 
 	proxyReq, err := http.NewRequestWithContext(ctx, r.Method, target.String(), nil)
@@ -418,7 +431,7 @@ func (fs *FilerServer) proxyMultiChunkCompute(w http.ResponseWriter, r *http.Req
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			body, timing, err := fs.fetchChunkComputeResult(ctx, r, fid, entry.Name(), operation, payload)
+			body, timing, err := fs.fetchChunkComputeResult(ctx, r, fid, entry.Name(), operation, payload, chunks[idx].GetOffset())
 			results[idx] = chunkResult{body: body, timing: timing, err: err}
 		}(i, fileId, payloadBytes)
 	}
@@ -436,27 +449,30 @@ func (fs *FilerServer) proxyMultiChunkCompute(w http.ResponseWriter, r *http.Req
 		summary.CacheHits, summary.Chunks,
 		summary.DeviceReadMs, summary.KernelMs, summary.PayloadBytes)
 
-	total := new(big.Int)
-	for i := range chunks {
+	// Aggregation is operator specific: additive numeric operators combine in
+	// the ring of 64-bit integers, ranking operators merge partial top-k lists.
+	bodies := make([][]byte, len(results))
+	for i := range results {
 		if results[i].err != nil {
 			writeJsonError(w, r, http.StatusInternalServerError, fmt.Errorf("chunk %d compute failed: %v", i, results[i].err))
 			return
 		}
-		text := strings.TrimSpace(string(results[i].body))
-		v, ok := new(big.Int).SetString(text, 10)
-		if !ok {
-			snippet := text
-			if len(snippet) > 128 {
-				snippet = snippet[:128]
-			}
-			writeJsonError(w, r, http.StatusBadRequest, fmt.Errorf("cross-chunk compute currently requires numeric per-chunk results, chunk %d returned (truncated): %q", i, snippet))
-			return
-		}
-		total.Add(total, v)
+		bodies[i] = results[i].body
+	}
+	var aggregate string
+	var aggregateErr error
+	if operation == imageSearchOperation {
+		aggregate, aggregateErr = mergeTopKResults(bodies, imageTopKFromQuery(r.URL.Query().Get("k")))
+	} else {
+		aggregate, aggregateErr = aggregateAdditiveResults(bodies)
+	}
+	if aggregateErr != nil {
+		writeJsonError(w, r, http.StatusBadRequest, aggregateErr)
+		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Header().Set("Content-Length", strconv.Itoa(len(total.String())))
-	io.WriteString(w, total.String())
+	w.Header().Set("Content-Length", strconv.Itoa(len(aggregate)))
+	io.WriteString(w, aggregate)
 }
 
 func volumeComputePath(fileId string, filename string) string {

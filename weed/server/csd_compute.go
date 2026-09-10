@@ -37,6 +37,12 @@ type csdComputeRequest struct {
 	ReadOffset   int64 `json:"read_offset"`
 	ReadSize     int64 `json:"read_size"`
 	PayloadShift int64 `json:"payload_shift"`
+
+	// Params carries operator parameters (top-k, record size, query descriptor)
+	// from the user request down to the device. Only small control data travels
+	// this way - the payload itself is still addressed by file offset, which is
+	// what keeps the query image on the client and off the wire.
+	Params map[string]string `json:"params,omitempty"`
 }
 
 type csdComputeResponse struct {
@@ -131,7 +137,7 @@ func (vs *VolumeServer) tryHandleCSDCompute(
 		return false
 	}
 
-	result, timing, err := vs.callCSDCompute(r.Context(), operation, region)
+	result, timing, err := vs.callCSDCompute(r.Context(), operation, region, csdOperatorParams(r))
 	if err != nil {
 		glog.Warningf("CSD compute %q volume %d needle %d: %v", operation, volumeId, n.Id, err)
 		return false
@@ -155,7 +161,26 @@ func (vs *VolumeServer) tryHandleCSDCompute(
 	return true
 }
 
-func (vs *VolumeServer) callCSDCompute(ctx context.Context, operation string, region storage.NeedleComputeRegion) ([]byte, csdComputeTiming, error) {
+// csdOperatorParams collects the operator parameters a user attached to the
+// compute request, excluding the operation selector itself. They are forwarded
+// verbatim to the device so new operators can be added without touching the
+// volume server.
+func csdOperatorParams(r *http.Request) map[string]string {
+	query := r.URL.Query()
+	params := make(map[string]string, len(query))
+	for name, values := range query {
+		if name == volumeComputeQuery || len(values) == 0 {
+			continue
+		}
+		params[name] = values[0]
+	}
+	if len(params) == 0 {
+		return nil
+	}
+	return params
+}
+
+func (vs *VolumeServer) callCSDCompute(ctx context.Context, operation string, region storage.NeedleComputeRegion, params map[string]string) ([]byte, csdComputeTiming, error) {
 	timeout := vs.computeConfig.CSDTimeout
 	if timeout <= 0 {
 		timeout = 60 * time.Second
@@ -171,6 +196,7 @@ func (vs *VolumeServer) callCSDCompute(ctx context.Context, operation string, re
 		ReadOffset:   region.ReadOffset,
 		ReadSize:     region.ReadSize,
 		PayloadShift: region.PayloadShift,
+		Params:       params,
 	})
 	if err != nil {
 		return nil, csdComputeTiming{}, err
