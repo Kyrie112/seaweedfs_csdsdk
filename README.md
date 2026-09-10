@@ -40,6 +40,13 @@ source /opt/xilinx/xrt/setup.sh
 make
 ```
 
+不需要 XRT 的检查(可在普通工作站 / CI 上运行):
+
+```bash
+make test          # 主机侧参考模型:对齐窗口与 v1/v2 求和语义的等价性
+make syntax-check  # 用 tools/cl_stub 的桩头文件对 agent 做类型检查
+```
+
 ## 运行
 
 ```bash
@@ -58,10 +65,10 @@ SeaweedFS volume 侧:
 
 ## 当前限制
 
-- 第一版要求数据以未压缩 needle 存储(压缩/chunk manifest 会由 SeaweedFS 自动回退 CPU);
-- 当前实现把数据区间 `pread` 到 FPGA buffer(无临时文件);
-  后续可升级为 XRT P2P buffer / NVMe 直读;
-- 设备端支持 `rawsum64` / `file_sum64` 同一求和内核。
+- 数据必须以未压缩 needle 存储(压缩 / chunk manifest 会由 SeaweedFS 自动回退 CPU);
+- 设备端只实现 `rawsum64` / `file_sum64` 同一求和内核;
+- v2 内核需要重新合成 xclbin(见下节);未重新合成的节点会自动退回 v1 语义,
+  结果依然正确,只是拿不到 needle 场景的 O_DIRECT。
 
 ## .9(SmartSSD 实机)编译与验证记录
 
@@ -113,3 +120,47 @@ XRT migrate;offset/size 满足 512B 对齐时启用 `O_DIRECT`。
 - 64B 非对齐请求:offset 0 → 54,offset 32 → 220;
 - 512B O_DIRECT+P2P 请求:期望 1760,返回 1760;
 - 日志不再出现 `unaligned host pointer ... extra memcpy`。
+
+## 对齐读与 v2 内核(V6)
+
+### 问题
+
+SeaweedFS needle 的数据区起点是 `needleOffset + NeedleHeaderSize + DataSizeSize`,
+即固定 `+20`,而 needle 在 `.dat` 中没有填充对齐。此前 agent 用
+`offset % 512 == 0 && size % 512 == 0` 判断能否 `O_DIRECT`,该条件在真实业务请求下
+几乎恒为假,所以实际走的是普通 `pread`(page cache + 主机内存),
+“P2P + O_DIRECT”只在人工构造对齐请求时才成立。
+
+### 做法
+
+1. SeaweedFS 在区间描述符中额外下发对齐窗口:
+   `read_offset`(payload 起点向下对齐)、`read_size`(覆盖 payload 的对齐长度)、
+   `payload_shift`(`offset - read_offset`);
+2. agent 用 `read_offset/read_size` 打开 `O_DIRECT` 读入 P2P buffer;
+3. 由于整段左移会改变 uint64 打包权重,内核升级为 v2,新增
+   `payload_shift` / `payload_size` 两个参数,使打包从 payload 首字节起算,
+   结果与“从 payload 首地址打包”逐字节一致;
+4. 兼容性:agent 启动时用 `CL_KERNEL_NUM_ARGS` 探测内核版本,3 参数按 v1 语义、
+   5 参数按 v2 语义;遇到其它参数个数直接报错而不是算错。
+
+### 重新合成 xclbin
+
+```bash
+/home/dess/workspace/dess_smartssd_setups/Vitis/2022.2/bin/v++ \
+  -t hw --platform /opt/xilinx/platforms/xilinx_u2_gen3x4_xdma_gc_2_202110_1/xilinx_u2_gen3x4_xdma_gc_2_202110_1.xpfm \
+  -c -k file_sum64 --temp_dir _x.hw -o _x.hw/file_sum64.xo src/file_sum64_kernel.cpp
+/home/dess/workspace/dess_smartssd_setups/Vitis/2022.2/bin/v++ \
+  -t hw --platform <同上> --link --temp_dir _x.hw \
+  -o _x.hw/file_sum64.link.xclbin _x.hw/file_sum64.xo
+cp _x.hw/file_sum64.link.xclbin file_sum64.xclbin
+```
+
+### 读取完整性与可观测性
+
+- `read_fully_at` 循环读满并在读不满时返回短计数,调用方据此报错,
+  不再出现“短读被当成成功”的静默错误;
+- agent 每次请求输出一行审计日志:
+  `window=[start,end) shift=… kernel=v1|v2 direct=yes|no read_ms=… kernel_ms=…`,
+  并累计 `direct_hits / direct_misses / short_reads`,可直接用于证明 O_DIRECT 是否生效;
+- 响应体新增 `read_ms` / `kernel_ms` / `direct` 字段,
+  SeaweedFS volume 侧转成 `X-CSD-Read-Ms` 等响应头,供 filer 汇总分阶段耗时。

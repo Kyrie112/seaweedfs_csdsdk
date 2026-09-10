@@ -14,6 +14,8 @@
 #include <CL/cl2.hpp>
 #include <CL/cl_ext_xilinx.h>
 
+#include "aligned_range.h"
+
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -23,6 +25,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -40,6 +43,43 @@ namespace {
   if (error != CL_SUCCESS) {                                          \
     throw std::runtime_error(std::string("OpenCL error calling ") + #call); \
   }
+
+// file_sum64 argument counts.
+//   v1: (buffer, byte_count, sum_out)
+//   v2: (buffer, byte_count, payload_shift, payload_size, sum_out)
+// The v2 extra arguments let the device skip the leading bytes of a block
+// aligned read window instead of the host shifting the payload, which would
+// cost one extra full copy through the P2P mapping.
+constexpr int kKernelArgsV1 = 3;
+constexpr int kKernelArgsV2 = 5;
+
+int64_t elapsed_ms(const std::chrono::steady_clock::time_point& start) {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now() - start)
+      .count();
+}
+
+// Counters that make the aligned path auditable from the agent log. The
+// direct_hits/direct_misses pair is the evidence that O_DIRECT is actually
+// being used for real SeaweedFS needle payloads.
+struct AgentStats {
+  uint64_t direct_hits = 0;
+  uint64_t direct_misses = 0;
+  uint64_t short_reads = 0;
+  uint64_t legacy_paths = 0;
+  uint64_t window_mismatches = 0;
+};
+
+struct ComputeOutcome {
+  std::string result;
+  int64_t read_offset = 0;
+  int64_t read_size = 0;
+  int64_t payload_shift = 0;
+  int64_t read_ms = 0;
+  int64_t kernel_ms = 0;
+  bool direct = false;
+  bool aligned_kernel = false;
+};
 
 template <typename T>
 struct aligned_allocator {
@@ -86,6 +126,12 @@ struct ComputeRequest {
   std::string data_file;
   int64_t offset = 0;
   int64_t size = 0;
+
+  // Aligned read window sent by SeaweedFS (v2 protocol). Negative means the
+  // field was absent, in which case the agent recomputes the window itself.
+  int64_t read_offset = -1;
+  int64_t read_size = -1;
+  int64_t payload_shift = -1;
 };
 
 std::string json_string(const std::string& body, const std::string& key) {
@@ -111,12 +157,24 @@ int64_t json_int(const std::string& body, const std::string& key) {
   return std::strtoll(body.c_str() + p + 1, nullptr, 10);
 }
 
+// json_int_or returns fallback when the key is absent, so "0" and "missing"
+// stay distinguishable for the optional aligned-window fields.
+int64_t json_int_or(const std::string& body, const std::string& key,
+                    int64_t fallback) {
+  const std::string needle = "\"" + key + "\"";
+  if (body.find(needle) == std::string::npos) return fallback;
+  return json_int(body, key);
+}
+
 ComputeRequest parse_request(const std::string& body) {
   ComputeRequest req;
   req.operation = json_string(body, "operation");
   req.data_file = json_string(body, "data_file");
   req.offset = json_int(body, "offset");
   req.size = json_int(body, "size");
+  req.read_offset = json_int_or(body, "read_offset", -1);
+  req.read_size = json_int_or(body, "read_size", -1);
+  req.payload_shift = json_int_or(body, "payload_shift", -1);
   if (req.operation.empty() || req.data_file.empty() || req.size < 0) {
     throw std::runtime_error("invalid compute request");
   }
@@ -159,19 +217,74 @@ class OpenClRuntime {
       throw std::runtime_error("build program failed: " + log);
     }
     program_ = std::make_unique<cl::Program>(raw, false);
+
+    cl::Kernel probe(*program_, "file_sum64", &err);
+    if (err != CL_SUCCESS) {
+      throw std::runtime_error("kernel file_sum64 not found in xclbin");
+    }
+    cl_uint arg_count = 0;
+    if (probe.getInfo(CL_KERNEL_NUM_ARGS, &arg_count) != CL_SUCCESS) {
+      throw std::runtime_error("cannot query file_sum64 argument count");
+    }
+    if (arg_count != kKernelArgsV1 && arg_count != kKernelArgsV2) {
+      throw std::runtime_error(
+          "file_sum64 takes " + std::to_string(arg_count) +
+          " arguments, expected 3 (v1) or 5 (v2); rebuild agent and xclbin together");
+    }
+    kernel_arg_count_ = static_cast<int>(arg_count);
   }
 
-  // Returns decimal result string.
-  std::string sum_range(const ComputeRequest& req) {
+  int kernel_arg_count() const { return kernel_arg_count_; }
+  const AgentStats& stats() const { return stats_; }
+
+  // Runs one compute request and reports the device-side cost breakdown.
+  ComputeOutcome sum_range(const ComputeRequest& req) {
     if (req.operation != "rawsum64" && req.operation != "file_sum64") {
       throw std::runtime_error("unsupported operation " + req.operation);
     }
+    ComputeOutcome outcome;
     if (req.size == 0) {
-      return "0";
+      outcome.result = "0";
+      return outcome;
     }
-    const std::size_t byte_count = static_cast<std::size_t>(req.size);
+    if (req.size < 0 || req.offset < 0) {
+      throw std::runtime_error("invalid range: negative offset or size");
+    }
+    outcome.aligned_kernel = (kernel_arg_count_ == kKernelArgsV2);
+
+    // The v2 kernel can skip a leading shift inside an aligned window; the v1
+    // kernel cannot, so it must be fed a buffer that starts exactly at the
+    // payload - which is exactly why v1 cannot use O_DIRECT for needle data.
+    csd::AlignedWindow window =
+        csd::plan_aligned_window(req.offset, req.size, csd::kReadAlignment);
+
+    if (req.read_size > 0) {
+      const csd::AlignedWindow declared{req.read_offset, req.read_size,
+                                        req.payload_shift};
+      if (!csd::covers(declared, req.offset, req.size)) {
+        // The agent owns its own device constraints: recompute and warn rather
+        // than compute a wrong answer over a window that does not cover the
+        // payload.
+        ++stats_.window_mismatches;
+        std::cerr << "csd_agent: ignoring inconsistent aligned window from "
+                     "volume server (declared read_offset="
+                  << req.read_offset << " read_size=" << req.read_size
+                  << " payload_shift=" << req.payload_shift
+                  << ", recomputed read_offset=" << window.read_offset
+                  << " read_size=" << window.read_size
+                  << " payload_shift=" << window.payload_shift << ")\n";
+      }
+    }
+    if (!outcome.aligned_kernel) {
+      ++stats_.legacy_paths;
+      window = csd::AlignedWindow{req.offset, req.size, 0};
+    }
+    outcome.read_offset = window.read_offset;
+    outcome.read_size = window.read_size;
+    outcome.payload_shift = window.payload_shift;
 
     cl_int err = CL_SUCCESS;
+    const std::size_t byte_count = static_cast<std::size_t>(window.read_size);
 
     // P2P buffer: map FPGA device memory into the host address space and read
     // the disk range straight into it. No host CL buffer and no XRT migrate of
@@ -188,27 +301,55 @@ class OpenClRuntime {
     if (p2p == nullptr || err != CL_SUCCESS) {
       throw std::runtime_error("map P2P input buffer failed");
     }
+    // Unmap on every exit path, including the error paths below.
+    struct Unmapper {
+      cl::CommandQueue* queue;
+      cl::Buffer* buffer;
+      void* ptr;
+      bool active;
+      ~Unmapper() {
+        if (active) queue->enqueueUnmapMemObject(*buffer, ptr);
+      }
+    } unmapper{queue_.get(), &input, p2p, true};
 
     int fd = ::open(req.data_file.c_str(), O_RDONLY);
     if (fd < 0) {
       throw std::runtime_error("cannot open data file " + req.data_file);
     }
-    // Use O_DIRECT only when the range can satisfy alignment; otherwise a plain
-    // pread still writes through the P2P mapping (no host CL buffer copy).
-    bool direct_ok = (req.offset % 512 == 0) && (req.size % 512 == 0);
-    if (direct_ok) {
+    // O_DIRECT needs an aligned file offset, an aligned length and an aligned
+    // buffer address. The window is aligned by construction, so the only
+    // remaining question is whether the P2P mapping itself is block aligned.
+    const bool window_aligned =
+        window.read_offset % csd::kReadAlignment == 0 &&
+        window.read_size % csd::kReadAlignment == 0 &&
+        reinterpret_cast<uintptr_t>(p2p) % csd::kReadAlignment == 0;
+    if (window_aligned) {
       const int fd_direct = ::open(req.data_file.c_str(), O_RDONLY | O_DIRECT);
       if (fd_direct >= 0) {
         ::close(fd);
         fd = fd_direct;
+        outcome.direct = true;
       }
     }
-    const ssize_t got = ::pread(fd, p2p, byte_count, static_cast<off_t>(req.offset));
+    if (outcome.direct) {
+      ++stats_.direct_hits;
+    } else {
+      ++stats_.direct_misses;
+    }
+
+    const auto read_start = std::chrono::steady_clock::now();
+    const ssize_t got = csd::read_fully_at(fd, p2p, byte_count, window.read_offset);
+    outcome.read_ms = elapsed_ms(read_start);
     ::close(fd);
-    if (got < 0) {
-      throw std::runtime_error("cannot read data range into P2P buffer " + req.data_file);
+    if (got != static_cast<ssize_t>(byte_count)) {
+      ++stats_.short_reads;
+      throw std::runtime_error("short read of " + req.data_file + ": wanted " +
+                               std::to_string(byte_count) + " bytes at offset " +
+                               std::to_string(window.read_offset) + ", got " +
+                               std::to_string(got));
     }
     OCL_CHECK(err, err = queue_->enqueueUnmapMemObject(input, p2p));
+    unmapper.active = false;
 
     std::vector<uint64_t, aligned_allocator<uint64_t>> result(1, 0);
     cl::Buffer output(*context_, CL_MEM_WRITE_ONLY | CL_MEM_USE_HOST_PTR,
@@ -220,12 +361,22 @@ class OpenClRuntime {
     unsigned arg = 0;
     OCL_CHECK(err, err = kernel.setArg(arg++, input));
     OCL_CHECK(err, err = kernel.setArg(arg++, static_cast<uint32_t>(byte_count)));
+    if (outcome.aligned_kernel) {
+      OCL_CHECK(err, err = kernel.setArg(
+                          arg++, static_cast<uint32_t>(window.payload_shift)));
+      OCL_CHECK(err, err = kernel.setArg(
+                          arg++, static_cast<uint32_t>(req.size)));
+    }
     OCL_CHECK(err, err = kernel.setArg(arg++, output));
+
+    const auto kernel_start = std::chrono::steady_clock::now();
     OCL_CHECK(err, err = queue_->enqueueTask(kernel));
     OCL_CHECK(err, err = queue_->enqueueMigrateMemObjects({output},
                                                          CL_MIGRATE_MEM_OBJECT_HOST));
     OCL_CHECK(err, err = queue_->finish());
-    return std::to_string(result[0]);
+    outcome.kernel_ms = elapsed_ms(kernel_start);
+    outcome.result = std::to_string(result[0]);
+    return outcome;
   }
 
  private:
@@ -233,6 +384,8 @@ class OpenClRuntime {
   std::unique_ptr<cl::Context> context_;
   std::unique_ptr<cl::CommandQueue> queue_;
   std::unique_ptr<cl::Program> program_;
+  int kernel_arg_count_ = 0;
+  AgentStats stats_;
 };
 
 bool send_all(int fd, const std::string& data) {
@@ -311,8 +464,27 @@ void handle_client(int client_fd, OpenClRuntime& runtime) {
     if (raw.rfind("POST ", 0) == 0 && raw.find("/v1/compute") != std::string::npos) {
       try {
         const ComputeRequest req = parse_request(body);
-        const std::string result = runtime.sum_range(req);
-        respond(client_fd, 200, "{\"result\":\"" + result + "\"}");
+        const ComputeOutcome outcome = runtime.sum_range(req);
+        std::ostringstream response;
+        response << "{\"result\":\"" << outcome.result << "\""
+                 << ",\"read_ms\":" << outcome.read_ms
+                 << ",\"kernel_ms\":" << outcome.kernel_ms
+                 << ",\"direct\":" << (outcome.direct ? "true" : "false")
+                 << ",\"aligned_kernel\":"
+                 << (outcome.aligned_kernel ? "true" : "false") << "}";
+        const AgentStats& stats = runtime.stats();
+        std::cerr << "csd_agent: size=" << req.size
+                  << " window=[" << outcome.read_offset << ","
+                  << (outcome.read_offset + outcome.read_size) << ")"
+                  << " shift=" << outcome.payload_shift
+                  << " kernel=" << (outcome.aligned_kernel ? "v2" : "v1")
+                  << " direct=" << (outcome.direct ? "yes" : "no")
+                  << " read_ms=" << outcome.read_ms
+                  << " kernel_ms=" << outcome.kernel_ms
+                  << " direct_hits=" << stats.direct_hits
+                  << " direct_misses=" << stats.direct_misses
+                  << " short_reads=" << stats.short_reads << "\n";
+        respond(client_fd, 200, response.str());
       } catch (const std::exception& e) {
         respond(client_fd, 500, "{\"error\":\"" + std::string(e.what()) + "\"}");
       }
@@ -347,6 +519,12 @@ int main(int argc, char** argv) {
 
   try {
     OpenClRuntime runtime(xclbin);
+    std::cerr << "csd_agent: file_sum64 args=" << runtime.kernel_arg_count()
+              << " ("
+              << (runtime.kernel_arg_count() == kKernelArgsV2
+                      ? "v2: aligned window supported, O_DIRECT used for needle payloads"
+                      : "v1: legacy payload-aligned reads only, no O_DIRECT for needles")
+              << ")\n";
     const int listen_fd = create_listener(listen);
     std::cerr << "csd_agent ready on " << listen << "\n";
     for (;;) {
