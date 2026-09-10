@@ -131,6 +131,11 @@ filer 记录每 chunk 与整请求的 dispatch/总耗时,并在日志中输出�
 3. **自适应并发**:替换硬编码的 `computeChunkFanoutConcurrency = 8`
    与 `16/host` 信号量,改为基于 RTT 与队列时延的反馈控制(AIMD),
    并验证其在带宽受限与设备争抢场景下的稳定性。
+   (相关的**自适应数据通路选择**已在阶段一提前完成原型:
+   agent 用 `preadv2(RWF_NOWAIT)` 感知页缓存并选择缓存/直读路径,
+   实测热场景 6.2× 加速、冷场景代价 ≈0,见
+   [reports/REPORT_PHASE1_HARDENING.md](reports/REPORT_PHASE1_HARDENING.md) 第 6 节;
+   下一步是补「缓存自举」机制——只走 compute 路径时页缓存永远是冷的。)
 4. **拓扑感知放置**:引入机架/交换机亲和,降低跨机架 chunk 比例。
 
 **验收标准**:给出调度模型的公式推导、近似算法的复杂度分析,

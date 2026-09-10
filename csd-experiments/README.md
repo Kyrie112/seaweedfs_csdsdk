@@ -24,7 +24,8 @@ csd-experiments/
 
 - [ROADMAP.md](ROADMAP.md):后续工作计划(阶段一机制修复 / 阶段二调度模型 / 阶段三算子与实验)
 - [tools/csd-agent-sim](tools/csd-agent-sim):无 FPGA 的软件 CSD agent(同协议、同语义)
-- [scripts/run_phase1_local.sh](scripts/run_phase1_local.sh):本地部署 + 三读路径性能实验
+- [scripts/run_phase1_local.sh](scripts/run_phase1_local.sh):本地部署 + 读路径/自适应策略性能实验
+  (`MODES="direct auto"` 可跑自适应缓存策略对比)
 
 ### 创新点
 

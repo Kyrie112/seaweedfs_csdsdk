@@ -1,0 +1,19 @@
+Adaptive data path selection (cache policy) experiment
+SeaweedFS master+volume+filer, file 64MB -> 16 chunks, 9 reps/config
+warm = payload seeded into the page cache by a normal (non-compute) read before each request
+cold = payload evicted with fadvise(DONTNEED) before each request
+
+wall time per compute request (ms)
+policy  cache    median      min      max cache_hits/chunks
+direct  warm      168.5    164.2    172.2              0/16
+direct  cold      197.0    177.1   1204.1              0/16
+auto    warm       27.1     26.3     47.6             16/16
+auto    cold      204.5    194.5    206.4              0/16
+
+direct_hits per request: {'direct': [16], 'auto': [16]}
+consistency: distinct results = {'190022035469879755652'}
+
+note: with only the compute path reading the file, the page cache is never
+populated (O_DIRECT does not fill it), so 'auto' degenerates to 'direct'.
+The warm numbers above are obtained by seeding the cache with a normal read,
+which is what FUSE/S3/replication traffic does in a real deployment.

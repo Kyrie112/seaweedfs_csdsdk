@@ -43,10 +43,12 @@ type csdComputeResponse struct {
 	Result string `json:"result"`
 	Error  string `json:"error,omitempty"`
 
-	// Per-stage device timings reported by the agent.
-	ReadMs   int64 `json:"read_ms,omitempty"`
-	KernelMs int64 `json:"kernel_ms,omitempty"`
-	Direct   bool  `json:"direct,omitempty"`
+	// Per-stage device timings and the read path actually taken, reported by
+	// the agent (path is one of cache/direct/buffered/legacy).
+	ReadMs   int64  `json:"read_ms,omitempty"`
+	KernelMs int64  `json:"kernel_ms,omitempty"`
+	Direct   bool   `json:"direct,omitempty"`
+	Path     string `json:"path,omitempty"`
 }
 
 // csdComputeTiming is the device-side cost breakdown of one CSD compute call.
@@ -54,6 +56,7 @@ type csdComputeTiming struct {
 	Direct   bool
 	ReadMs   int64
 	KernelMs int64
+	Path     string
 }
 
 // Response headers used to carry device-side timings back through the volume
@@ -64,6 +67,7 @@ const (
 	csdHeaderDirect   = "X-CSD-Direct"
 	csdHeaderReadMs   = "X-CSD-Read-Ms"
 	csdHeaderKernelMs = "X-CSD-Kernel-Ms"
+	csdHeaderPath     = "X-CSD-Path"
 )
 
 // csdSupported reports whether the CSD compute path is configured for this
@@ -138,6 +142,9 @@ func (vs *VolumeServer) tryHandleCSDCompute(
 	w.Header().Set(csdHeaderDirect, strconv.FormatBool(timing.Direct))
 	w.Header().Set(csdHeaderReadMs, strconv.FormatInt(timing.ReadMs, 10))
 	w.Header().Set(csdHeaderKernelMs, strconv.FormatInt(timing.KernelMs, 10))
+	if timing.Path != "" {
+		w.Header().Set(csdHeaderPath, timing.Path)
+	}
 	if _, err := w.Write(result); err != nil {
 		glog.V(2).Infof("CSD compute response write error: %v", err)
 	}
@@ -198,6 +205,7 @@ func (vs *VolumeServer) callCSDCompute(ctx context.Context, operation string, re
 		Direct:   parsed.Direct,
 		ReadMs:   parsed.ReadMs,
 		KernelMs: parsed.KernelMs,
+		Path:     parsed.Path,
 	}
 	return []byte(parsed.Result), timing, nil
 }

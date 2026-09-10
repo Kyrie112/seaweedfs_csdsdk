@@ -23,6 +23,8 @@
 //	         payload using payload_shift
 //	direct   read the aligned window with O_DIRECT, then pack the payload
 //	         using payload_shift (the behaviour the fixed agent has)
+//	auto     probe the page cache first and use it on a hit, otherwise fall
+//	         back to the direct path (adaptive data path selection)
 //
 // Endpoints:
 //
@@ -33,6 +35,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -56,6 +59,11 @@ const (
 	modeLegacy  readMode = "legacy"
 	modeAligned readMode = "aligned"
 	modeDirect  readMode = "direct"
+	// modeAuto probes the page cache with preadv2(RWF_NOWAIT) first: a
+	// successful probe means the data is already resident and the probe read
+	// *is* the data transfer, so it costs nothing extra. A miss (EAGAIN) or a
+	// partial hit falls back to the aligned O_DIRECT read.
+	modeAuto readMode = "auto"
 )
 
 // computeRequest mirrors csdComputeRequest in weed/server/csd_compute.go.
@@ -76,6 +84,8 @@ type computeResponse struct {
 	KernelMs  int64  `json:"kernel_ms,omitempty"`
 	Direct    bool   `json:"direct,omitempty"`
 	ReadBytes int64  `json:"read_bytes,omitempty"`
+	Path      string `json:"path,omitempty"`
+	ProbeMs   int64  `json:"probe_ms,omitempty"`
 }
 
 type window struct {
@@ -165,15 +175,19 @@ func readFullyAt(fd int, buf []byte, offset int64) (int, error) {
 }
 
 type agent struct {
-	mode     readMode
-	evict    bool
-	mu       sync.Mutex
-	last     computeRequest
-	requests int64
-	directHi int64
-	directLo int64
-	short    int64
-	readBy   int64
+	mode      readMode
+	evict     bool
+	mu        sync.Mutex
+	last      computeRequest
+	requests  int64
+	directHi  int64
+	directLo  int64
+	short     int64
+	readBy    int64
+	cacheHit  int64
+	cachePart int64
+	cacheMiss int64
+	probeErr  int64
 }
 
 func (a *agent) handleCompute(w http.ResponseWriter, r *http.Request) {
@@ -209,11 +223,13 @@ func (a *agent) run(req computeRequest) (computeResponse, int) {
 		}
 	}
 
-	useDirect := a.mode == modeDirect
+	useDirect := a.mode == modeDirect || a.mode == modeAuto
+	probeCache := a.mode == modeAuto
 	if a.mode == modeLegacy {
 		// v1 semantics: the buffer must start exactly at the payload.
 		w = window{readOffset: req.Offset, readSize: req.Size}
 		useDirect = false
+		probeCache = false
 	}
 
 	buf, err := newAlignedBuffer(w.readSize)
@@ -274,17 +290,50 @@ func (a *agent) run(req computeRequest) (computeResponse, int) {
 	readStart := time.Now()
 	var got int
 	var readErr error
-	if direct {
-		got, readErr = readFullyAt(directFD, buf.slice[:directLen], w.readOffset)
-		if readErr == nil && int64(got) == directLen && available > directLen {
-			// The sub-block tail must go through a buffered descriptor: an
-			// O_DIRECT descriptor rejects it with EINVAL.
-			var tail int
-			tail, readErr = readFullyAt(fd, buf.slice[directLen:available], w.readOffset+directLen)
-			got += tail
+	path := string(a.mode)
+	var cacheHit, cachePartial, cacheMiss, probeErr bool
+	var probeMs int64
+
+	if probeCache {
+		// preadv2(RWF_NOWAIT) only succeeds without blocking when the range is
+		// already in the page cache. A full success is not a wasted probe: the
+		// bytes are already in the destination buffer.
+		n, perr := unix.Preadv2(fd, [][]byte{buf.slice[:available]}, w.readOffset, unix.RWF_NOWAIT)
+		probeMs = time.Since(readStart).Milliseconds()
+		switch {
+		case perr == nil && int64(n) == available:
+			got = n
+			path = "cache"
+			cacheHit = true
+		case perr == nil:
+			// Partial hit: discard and re-read the whole window directly.
+			path = "direct"
+			cachePartial = true
+		case errors.Is(perr, unix.EAGAIN):
+			path = "direct"
+			cacheMiss = true
+		default:
+			path = "direct"
+			probeErr = true
 		}
-	} else {
-		got, readErr = readFullyAt(fd, buf.slice[:available], w.readOffset)
+	}
+
+	if path != "cache" {
+		if direct {
+			got, readErr = readFullyAt(directFD, buf.slice[:directLen], w.readOffset)
+			if readErr == nil && int64(got) == directLen && available > directLen {
+				// The sub-block tail must go through a buffered descriptor: an
+				// O_DIRECT descriptor rejects it with EINVAL.
+				var tail int
+				tail, readErr = readFullyAt(fd, buf.slice[directLen:available], w.readOffset+directLen)
+				got += tail
+			}
+		} else {
+			got, readErr = readFullyAt(fd, buf.slice[:available], w.readOffset)
+		}
+		if path == "auto" {
+			path = "buffered-fallback"
+		}
 	}
 	readMs := time.Since(readStart).Milliseconds()
 	if directFD >= 0 {
@@ -304,6 +353,18 @@ func (a *agent) run(req computeRequest) (computeResponse, int) {
 	if readErr != nil || int64(got) != available {
 		a.short++
 	}
+	if cacheHit {
+		a.cacheHit++
+	}
+	if cachePartial {
+		a.cachePart++
+	}
+	if cacheMiss {
+		a.cacheMiss++
+	}
+	if probeErr {
+		a.probeErr++
+	}
 	a.mu.Unlock()
 
 	if readErr != nil {
@@ -320,8 +381,8 @@ func (a *agent) run(req computeRequest) (computeResponse, int) {
 	sum := sumPayload(buf.slice, w.payloadShift, req.Size)
 	kernelMs := time.Since(kernelStart).Milliseconds()
 
-	log.Printf("compute size=%d window=[%d,%d) shift=%d mode=%s direct=%v read_ms=%d kernel_ms=%d result=%d",
-		req.Size, w.readOffset, w.readOffset+w.readSize, w.payloadShift, a.mode, direct, readMs, kernelMs, sum)
+	log.Printf("compute size=%d window=[%d,%d) shift=%d mode=%s path=%s direct=%v probe_ms=%d read_ms=%d kernel_ms=%d result=%d",
+		req.Size, w.readOffset, w.readOffset+w.readSize, w.payloadShift, a.mode, path, direct, probeMs, readMs, kernelMs, sum)
 
 	return computeResponse{
 		Result:    fmt.Sprintf("%d", sum),
@@ -329,6 +390,8 @@ func (a *agent) run(req computeRequest) (computeResponse, int) {
 		KernelMs:  kernelMs,
 		Direct:    direct,
 		ReadBytes: int64(got),
+		Path:      path,
+		ProbeMs:   probeMs,
 	}, http.StatusOK
 }
 
@@ -343,6 +406,10 @@ func (a *agent) handleStats(w http.ResponseWriter, _ *http.Request) {
 		"short_reads":   a.short,
 		"read_bytes":    a.readBy,
 		"evict":         a.evict,
+		"cache_hits":    a.cacheHit,
+		"cache_partial": a.cachePart,
+		"cache_misses":  a.cacheMiss,
+		"probe_errors":  a.probeErr,
 	})
 }
 
@@ -371,9 +438,9 @@ func main() {
 
 	selected := readMode(*mode)
 	switch selected {
-	case modeLegacy, modeAligned, modeDirect:
+	case modeLegacy, modeAligned, modeDirect, modeAuto:
 	default:
-		fmt.Fprintf(os.Stderr, "unknown -mode %q (want legacy, aligned or direct)\n", *mode)
+		fmt.Fprintf(os.Stderr, "unknown -mode %q (want legacy, aligned, direct or auto)\n", *mode)
 		os.Exit(2)
 	}
 

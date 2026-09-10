@@ -17,6 +17,7 @@ WORK=${WORK:-/tmp/csd-exp}
 CSV=${CSV:-$(cd "$(dirname "$0")/.." && pwd)/results/phase1_local.csv}
 SIZE_MB=${1:-16}
 REPS=${2:-5}
+MODES=${MODES:-"legacy aligned direct auto"}
 
 MASTER_PORT=19333
 VOLUME_PORT=18080
@@ -27,6 +28,10 @@ AGENT_URL="http://127.0.0.1:${AGENT_PORT}"
 DATA_FILE="$WORK/data.bin"
 UPLOAD_PATH="/data/phase1.bin"
 COMPUTE_URL="http://127.0.0.1:${FILER_PORT}${UPLOAD_PATH}?compute=rawsum64"
+# A plain (non-compute) read: this is what populates the page cache in a real
+# deployment (FUSE mount, S3 GET, replication), and it is the situation the
+# adaptive policy is meant to exploit.
+PLAIN_URL="http://127.0.0.1:${FILER_PORT}${UPLOAD_PATH}"
 
 AGENT_PID=""
 MASTER_PID=""
@@ -117,13 +122,13 @@ curl -s -F "file=@$DATA_FILE" "http://127.0.0.1:${FILER_PORT}${UPLOAD_PATH}" > "
 cat "$WORK/upload.json" >&2
 echo >&2
 
-echo "mode,cache,rep,http_code,total_ms,result,chunks,dispatch_ms,device_read_ms,kernel_ms,direct_hits,payload_bytes,agent_read_bytes,agent_direct" > "$CSV"
+echo "mode,cache,rep,http_code,total_ms,result,chunks,dispatch_ms,device_read_ms,kernel_ms,direct_hits,cache_hits,payload_bytes,agent_read_bytes,agent_direct" > "$CSV"
 
 RESULT_FILE="$WORK/body.txt"
 EXPECTED=""
 LAST_CHUNKS=1
 
-for mode in legacy aligned direct; do
+for mode in $MODES; do
   for cache in warm cold; do
     evict=false
     [ "$cache" = cold ] && evict=true
@@ -131,6 +136,10 @@ for mode in legacy aligned direct; do
     start_agent "$mode" "$evict"
     curl -s -o "$RESULT_FILE" "$COMPUTE_URL" > /dev/null   # untimed warm-up
     for rep in $(seq 1 "$REPS"); do
+      if [ "$cache" = warm ]; then
+        # Cache the payload through the normal read path, untimed.
+        curl -s -o /dev/null "$PLAIN_URL"
+      fi
       hdr="$WORK/hdr.txt"
       rm -f "$hdr"
       timing=$(curl -s -o "$RESULT_FILE" -D "$hdr" -w '%{http_code} %{time_total}' "$COMPUTE_URL")
@@ -142,15 +151,16 @@ for mode in legacy aligned direct; do
       devread=$(grep -i '^X-Compute-Device-Read-Ms:' "$hdr" | tr -d '\r' | awk '{print $2}')
       kernel=$(grep -i '^X-Compute-Kernel-Ms:' "$hdr" | tr -d '\r' | awk '{print $2}')
       hits=$(grep -i '^X-Compute-Direct-Hits:' "$hdr" | tr -d '\r' | awk '{print $2}')
+      chits=$(grep -i '^X-Compute-Cache-Hits:' "$hdr" | tr -d '\r' | awk '{print $2}')
       payload=$(grep -i '^X-Compute-Payload-Bytes:' "$hdr" | tr -d '\r' | awk '{print $2}')
       stats=$(curl -s "$AGENT_URL/v1/stats")
       area=$(printf '%s' "$stats" | python3 -c 'import json,sys; print(json.load(sys.stdin)["read_bytes"])')
       adirect=$(printf '%s' "$stats" | python3 -c 'import json,sys; print(json.load(sys.stdin)["direct_hits"])')
       total_ms=$(awk -v t="$total" 'BEGIN{printf "%.2f", t*1000}')
-      printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+      printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
         "$mode" "$cache" "$rep" "$http_code" "$total_ms" "$result" \
-        "${chunks:-}" "${dispatch:-}" "${devread:-}" "${kernel:-}" "${hits:-}" "${payload:-}" "$area" "$adirect" >> "$CSV"
-      log "  rep=$rep ${total_ms}ms result=$result chunks=${chunks:-?} dispatch_sum=${dispatch:-?}ms read_sum=${devread:-?}ms kernel_sum=${kernel:-?}ms direct_hits=${hits:-?} agent_read_bytes=$area"
+        "${chunks:-}" "${dispatch:-}" "${devread:-}" "${kernel:-}" "${hits:-}" "${chits:-0}" "${payload:-}" "$area" "$adirect" >> "$CSV"
+      log "  rep=$rep ${total_ms}ms chunks=${chunks:-?} dispatch_sum=${dispatch:-?}ms read_sum=${devread:-?}ms kernel_sum=${kernel:-?}ms direct_hits=${hits:-?} cache_hits=${chits:-?} agent_read_bytes=$area"
       if [ -z "$EXPECTED" ]; then EXPECTED="$result"; fi
       LAST_CHUNKS="${chunks:-1}"
     done
@@ -223,7 +233,8 @@ rows = list(csv.DictReader(open(sys.argv[1])))
 buckets = {}
 for r in rows:
     buckets.setdefault((r["mode"], r["cache"]), []).append(float(r["total_ms"]))
-order = ["legacy", "aligned", "direct"]
+order = ["legacy", "aligned", "direct", "auto"]
+order = [m for m in order if m in {k[0] for k in buckets}]
 print(f"{'mode':8} {'cache':5} {'n':>3} {'median_ms':>10} {'min_ms':>8} {'max_ms':>8}")
 for key in sorted(buckets, key=lambda k: (order.index(k[0]), k[1])):
     vals = buckets[key]

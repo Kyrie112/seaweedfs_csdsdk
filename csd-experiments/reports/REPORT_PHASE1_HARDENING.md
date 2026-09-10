@@ -13,6 +13,7 @@
 | P1-3 调度器加固 | 已完成 | 探测不再持锁、失败副本被排除、负载按字节加权 |
 | P1-4 分阶段耗时观测 | 已完成 | dispatch / 设备读 / 内核三段耗时可按 chunk 导出 |
 | 本地部署 + 性能实验 | 已完成 | 64MB/16 chunk,O_DIRECT 全命中;冷缓存下时延 −27% |
+| 自适应数据通路选择原型 | 已完成并量化 | 热场景 6.2× 加速,冷场景代价 ≈0;含「无法自举」的反面结论 |
 | 真机 xclbin 重合成与端到端实测 | 待执行(需 .9 机器) | 命令与验收标准见第 8 节 |
 
 两个核心结论:
@@ -193,7 +194,59 @@ agent 返回 `read_ms` / `kernel_ms` / `direct` → volume 转
 - 需要说明:本容器为共享环境(无独占 NVMe、有其他负载),时延绝对值仅作趋势参考,
   权威数字需要在 .9 真机上重测。
 
-## 6. 单元与参考测试验证
+## 6. 自适应数据通路选择(阶段二前置原型)
+
+第 5.4 节的反向结论直接指向一个设计问题:既然 O_DIRECT 在冷数据上更快、
+页缓存命中时更慢,能不能**先感知、再决定**?本节实现了该原型并量化收益。
+
+### 6.1 感知手段与实测
+
+| 手段 | 语义 | 实测 |
+| --- | --- | --- |
+| `mincore(2)` | mmap 后逐页报告常驻状态 | 命中 100%(2048/2048 页),`fadvise(DONTNEED)` 后 0%;4MiB 探测 66µs(首次含 mmap 开销 247µs) |
+| `preadv2(RWF_NOWAIT)` | 不等待地读,**成功即数据已到手** | 命中→立即返回;未命中→`EAGAIN`,10µs |
+
+选 `RWF_NOWAIT` 的理由是「探测即读取」:命中时那次 syscall 本身就是数据搬运,
+没有额外开销;未命中只是一次 10µs 的快速失败。相对 30–200ms 的请求时延,
+探测成本可忽略,因此**按请求探测是可行的**——这一点与直觉相反。
+
+### 6.2 策略与实现
+
+- agent 新增 `--cache-policy=auto|direct|buffered`(默认 `auto`);
+- `auto` 流程:用 `preadv2(RWF_NOWAIT)` 读对齐窗口 → 完整成功即采用缓存结果;
+  `EAGAIN` 或**短读(部分命中)** → 丢弃并回退到 O_DIRECT 整窗重读;
+- 回退是显式的,**预测失败只会退化为原路径,不会让请求失败**;
+- 计数 `cache_hits` / `cache_partial` / `cache_misses` / `probe_errors`,
+  经 `X-CSD-Path` → `X-Compute-Cache-Hits` 汇总到 filer 侧。
+
+### 6.3 实验结果
+
+64MB / 16 chunk,9 次重复,中位数:
+
+| 策略 | 热(先经普通读预热页缓存) | 冷(每请求驱逐) | 缓存命中 |
+| --- | --- | --- | --- |
+| `direct`(始终 O_DIRECT) | 168.5 ms | 197.0 ms | 0/16 |
+| `auto`(自适应) | **27.1 ms** | 204.5 ms | 16/16(热)、0/16(冷) |
+
+- 热场景自适应快 **6.2 倍**(27.1 vs 168.5ms),因为走了页缓存;
+- 冷场景与纯 O_DIRECT 基本持平(204.5 vs 197.0ms),代价在噪声量级;
+- 所有配置结果依然完全一致(`190022035469879755652`),正确性不受策略影响。
+
+### 6.4 一个必须写下来的反面结论:自适应无法自举
+
+第一次实验里 `auto` 的热场景**没有拿到任何收益**(184ms,与 direct 持平)。
+原因是:**O_DIRECT 读不填充页缓存**。如果 compute 路径是文件唯一的读者,
+缓存永远是冷的,`auto` 会持续命中失败、退化成「永远 direct」。
+
+把热场景改成「先用普通读(模拟 FUSE / S3 / 副本复制)预热」后,收益立刻出现。
+由此得到两条设计结论:
+
+1. 自适应策略的收益依赖**数据也被普通读路径访问过**;
+2. 若负载是「反复计算同一区间、且只经过 compute 路径」,需要额外机制
+   (例如首次访问做一次带缓存的读来「种」缓存,或按热度统计周期性回退到缓冲读),
+   而这类机制必须权衡缓存污染,是阶段三值得展开的点。
+
+## 7. 单元与参考测试验证
 
 | 验证项 | 命令 | 结果 |
 | --- | --- | --- |
@@ -208,7 +261,7 @@ agent 返回 `read_ms` / `kernel_ms` / `direct` → volume 转
 failover 排除集;字节加权与请求数次级信号;以及一个确定性用例证明
 能力探测不再被调度锁串行化。
 
-## 7. 交付物
+## 8. 交付物
 
 ### SeaweedFS 仓库(分支 `feat/csd-native-compute`)
 
@@ -225,7 +278,8 @@ failover 排除集;字节加权与请求数次级信号;以及一个确定性用
 | `csd-experiments/ROADMAP.md` | 后续工作计划 |
 | `csd-experiments/tools/csd-agent-sim/` | 新增:无 FPGA 的软件 CSD agent |
 | `csd-experiments/scripts/run_phase1_local.sh` | 新增:本地部署实验 |
-| `csd-experiments/results/phase1_local.csv` / `_summary.txt` | 新增:实验数据与汇总 |
+| `csd-experiments/results/phase1_local.csv` / `_summary.txt` | 新增:三读路径实验数据与汇总 |
+| `csd-experiments/results/phase1_cache_policy.csv` / `_summary.txt` | 新增:自适应策略实验数据与汇总 |
 
 ### SmartSSD 模块仓库
 
@@ -233,12 +287,12 @@ failover 排除集;字节加权与请求数次级信号;以及一个确定性用
 | --- | --- |
 | `src/aligned_range.h` | 新增(窗口几何、EOF 截断、参考求和模型、读满循环) |
 | `src/file_sum64_kernel.cpp` | v2 内核 |
-| `src/csd_agent.cpp` | 对齐 O_DIRECT、EOF 截断、短读校验、内核版本探测、审计日志 |
+| `src/csd_agent.cpp` | 对齐 O_DIRECT、EOF 截断、短读校验、内核版本探测、审计日志、`--cache-policy` 自适应策略 |
 | `src/range_sum_test.cpp` | 新增(主机侧参考测试) |
 | `tools/cl_stub/` | 新增(仅编译检查用 OpenCL 桩头) |
 | `Makefile` / `README.md` | `make test`、`make syntax-check` 与说明 |
 
-## 8. 在 .9 机器上需要执行的收尾步骤
+## 9. 在 .9 机器上需要执行的收尾步骤
 
 ```bash
 # 1. 合成 v2 xclbin(约 2 小时)
@@ -259,13 +313,13 @@ make && ./build/csd_agent --xclbin=file_sum64.xclbin --listen=127.0.0.1:18090
 验收标准:非对齐 needle 请求日志出现 `direct=yes`;`direct_misses` / `short_reads`
 为 0(或可解释);求和结果与 CPU 参考一致。
 
-## 9. 已知环境问题(与本次改动无关)
+## 10. 已知环境问题(与本次改动无关)
 
 在本次容器中执行 `go test ./weed/storage/` 时,`TestMemIndexCompaction` 会超时
 (卡在 `fsync`)。已用 `git stash` 在**未修改的原始基线**上复跑同一用例,
 现象完全一致,属于容器磁盘/IO 压力导致的既有问题。
 
-## 10. 复现命令
+## 11. 复现命令
 
 ```bash
 # Go 单元测试
@@ -282,5 +336,10 @@ cd ../seaweedfs_csdsdk
 go build -o /tmp/weed_phase1 ./weed/
 go build -o /tmp/csd-agent-sim ./csd-experiments/tools/csd-agent-sim/
 WEED=/tmp/weed_phase1 AGENT=/tmp/csd-agent-sim \
+  ./csd-experiments/scripts/run_phase1_local.sh 64 9
+
+# 自适应缓存策略对比(热场景会先用普通读预热页缓存)
+WEED=/tmp/weed_phase1 AGENT=/tmp/csd-agent-sim MODES="direct auto" \
+  CSV=./csd-experiments/results/phase1_cache_policy.csv \
   ./csd-experiments/scripts/run_phase1_local.sh 64 9
 ```

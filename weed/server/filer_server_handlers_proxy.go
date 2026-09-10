@@ -198,6 +198,7 @@ type chunkComputeTiming struct {
 	Direct       bool
 	DeviceReadMs int64
 	KernelMs     int64
+	Path         string
 }
 
 // computeTimingSummary aggregates per-chunk timings for logging and for the
@@ -205,6 +206,7 @@ type chunkComputeTiming struct {
 type computeTimingSummary struct {
 	Chunks       int
 	DirectHits   int
+	CacheHits    int
 	DispatchMs   int64
 	DeviceReadMs int64
 	KernelMs     int64
@@ -216,6 +218,9 @@ func summarizeComputeTiming(timings []chunkComputeTiming) computeTimingSummary {
 	for _, timing := range timings {
 		if timing.Direct {
 			summary.DirectHits++
+		}
+		if timing.Path == "cache" {
+			summary.CacheHits++
 		}
 		summary.DispatchMs += timing.DispatchMs
 		summary.DeviceReadMs += timing.DeviceReadMs
@@ -238,6 +243,7 @@ func setComputeTimingHeaders(w http.ResponseWriter, timings []chunkComputeTiming
 	w.Header().Set("X-Compute-Device-Read-Ms", strconv.FormatInt(summary.DeviceReadMs, 10))
 	w.Header().Set("X-Compute-Kernel-Ms", strconv.FormatInt(summary.KernelMs, 10))
 	w.Header().Set("X-Compute-Direct-Hits", strconv.Itoa(summary.DirectHits))
+	w.Header().Set("X-Compute-Cache-Hits", strconv.Itoa(summary.CacheHits))
 	w.Header().Set("X-Compute-Payload-Bytes", strconv.FormatInt(summary.PayloadBytes, 10))
 }
 
@@ -316,6 +322,7 @@ func (fs *FilerServer) fetchChunkComputeResult(ctx context.Context, r *http.Requ
 			timing.Direct = deviceTiming.Direct
 			timing.DeviceReadMs = deviceTiming.ReadMs
 			timing.KernelMs = deviceTiming.KernelMs
+			timing.Path = deviceTiming.Path
 			return chunkBody, timing, nil
 		}
 		excluded[csdHostOf(raw)] = struct{}{}
@@ -379,6 +386,7 @@ func (fs *FilerServer) fetchFromComputeReplica(ctx context.Context, r *http.Requ
 		Direct:   strings.EqualFold(proxyResponse.Header.Get(csdHeaderDirect), "true"),
 		ReadMs:   parseHeaderInt64(proxyResponse.Header.Get(csdHeaderReadMs)),
 		KernelMs: parseHeaderInt64(proxyResponse.Header.Get(csdHeaderKernelMs)),
+		Path:     proxyResponse.Header.Get(csdHeaderPath),
 	}
 	body, err := io.ReadAll(io.LimitReader(proxyResponse.Body, computeChunkMaxResultBytes))
 	if err != nil {
@@ -422,9 +430,10 @@ func (fs *FilerServer) proxyMultiChunkCompute(w http.ResponseWriter, r *http.Req
 	}
 	summary := summarizeComputeTiming(timings)
 	setComputeTimingHeaders(w, timings)
-	glog.V(1).InfofCtx(ctx, "compute %q across %d chunks: wall_ms=%d sum_dispatch_ms=%d fanout=%d csd_direct_hits=%d/%d device_read_ms=%d kernel_ms=%d payload_bytes=%d",
+	glog.V(1).InfofCtx(ctx, "compute %q across %d chunks: wall_ms=%d sum_dispatch_ms=%d fanout=%d csd_direct_hits=%d/%d csd_cache_hits=%d/%d device_read_ms=%d kernel_ms=%d payload_bytes=%d",
 		operation, len(chunks), time.Since(started).Milliseconds(), summary.DispatchMs,
 		computeChunkFanoutConcurrency, summary.DirectHits, summary.Chunks,
+		summary.CacheHits, summary.Chunks,
 		summary.DeviceReadMs, summary.KernelMs, summary.PayloadBytes)
 
 	total := new(big.Int)
