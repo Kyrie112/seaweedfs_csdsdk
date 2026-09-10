@@ -2,7 +2,8 @@
 
 分支:`feat/csd-native-compute`
 
-与 SeaweedFS 分支 `feat/csd-native-compute` 配套的 CSD 计算模块。
+本目录是 SeaweedFS 仓库内的设备侧计算模块(原独立仓库
+`smartssd_compute_module`,已通过 `git subtree` 并入,历史完整保留)。
 SeaweedFS volume 只下发 `{data_file, offset, size, operation}`,
 本模块在 SmartSSD 设备上常驻运行,把 volume `.dat` 的精确数据区间送入
 FPGA 计算内核,返回算子结果;整个过程不经过 SeaweedFS 的临时文件/脚本路径。

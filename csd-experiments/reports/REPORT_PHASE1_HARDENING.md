@@ -30,7 +30,7 @@
 
 | # | 缺陷 | 影响 | 位置(修复前) |
 | --- | --- | --- | --- |
-| 1 | `O_DIRECT` 判定恒为假 | 近存计算“零拷贝”卖点未兑现 | `smartssd_compute_module/src/csd_agent.cpp:198` |
+| 1 | `O_DIRECT` 判定恒为假 | 近存计算“零拷贝”卖点未兑现 | `smartssd/src/csd_agent.cpp:198` |
 | 2 | 短读未校验 | 读到部分数据时静默返回错误结果 | `csd_agent.cpp:206` |
 | 3 | 调度器锁粒度过大 / 重试无排除集 / 负载按请求计数 | 探测串行化;failover 可能重选失败副本 | `weed/server/filer_csd_scheduler.go` |
 | 4 | 对齐窗口越过 `.dat` 文件末尾时被判为短读 | 卷文件中**最后一个 needle** 的请求会间歇性失败 | `aligned_range.h` / `csd_agent.cpp` |
@@ -147,10 +147,13 @@ agent 返回 `read_ms` / `kernel_ms` / `direct` → volume 转
   `190022035469879755652`;
 - **单 chunk 独立验证**:2MB 文件,SeaweedFS 结果 == 独立 Python 实现结果
   (`7256256511392428663`),且该请求 `direct_hits = 1`;
-- **16 chunk 聚合独立验证**:按“每 chunk 求和后取模 2^64、聚合不再取模”的
-  真实语义独立复算,结果完全一致(`190022035469879755652`);
+- **16 chunk 聚合独立验证**:按“各块结果取模 2^64、聚合再归约到 2^64”的语义
+  独立复算,结果完全一致(`5554594732784239492`),与单 chunk 路径同一值域;
 - 三种读路径结果完全一致 ⇒ 对齐窗口 + `payload_shift` 的语义等价性在
   **真实 needle 布局**上得到端到端确认。
+
+> 说明:聚合语义在阶段一后期被收紧(见 4.3 节定理),此后重跑实验时
+> 多块聚合的返回值由未归约的大整数改为模 2^64 归约值,单块/多块/整文件三者一致。
 
 ### 5.3 性能结果
 
@@ -221,7 +224,8 @@ agent 返回 `read_ms` / `kernel_ms` / `direct` → volume 转
 
 ### 6.3 实验结果
 
-64MB / 16 chunk,9 次重复,中位数:
+64MB / 16 chunk,9 次重复,中位数(整合 smartssd 模块后以 7 次重复复跑,
+结论方向一致:direct 冷 171.9 ms、auto 热 25.9 ms):
 
 | 策略 | 热(先经普通读预热页缓存) | 冷(每请求驱逐) | 缓存命中 |
 | --- | --- | --- | --- |
@@ -329,7 +333,7 @@ go test ./weed/server/ -run 'CSD|Compute|Rank|Scheduler' -count=1
 go test ./weed/storage/ -run TestComputeAlignedWindow -count=1
 
 # C++ 参考测试与类型检查(无需 XRT)
-cd ../smartssd_compute_module && make test && make syntax-check
+make -C smartssd test && make -C smartssd syntax-check
 
 # 本地部署 + 性能实验(需要先构建 weed 与软件 agent)
 cd ../seaweedfs_csdsdk

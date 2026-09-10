@@ -1,5 +1,23 @@
 # SeaweedFS
 
+> **本仓库的可计算存储扩展(SeaweedFS + SmartSSD)**
+>
+> 本仓库在上游 SeaweedFS 基础上增加了完整的计算下沉能力:统一的文件/对象/块
+> 计算入口、跨数据块并行编排与聚合、CSD 感知与负载感知的副本调度、
+> 基于页缓存感知的自适应数据通路,以及近存以图搜图(Top-K)算子。
+>
+> | 目录 | 内容 |
+> | --- | --- |
+> | `smartssd/` | 设备侧 CSD agent、FPGA 内核、主机侧参考测试(无需 FPGA 即可测试) |
+> | `csd-experiments/tools/csd-agent-sim/` | 软件 CSD agent(无 FPGA 时的端到端实验用) |
+> | `csd-experiments/scripts/` | 一键部署与实验脚本(读路径、自适应通路、以图搜图) |
+> | `csd-experiments/reports/` | 论文初稿、阶段验证报告、项目总览 |
+> | `csd-experiments/results/` | 全部实验原始数据 |
+>
+> 快速入口:[论文初稿](csd-experiments/reports/THESIS_DRAFT.md)、
+> [项目总览](csd-experiments/reports/REPORT_PROJECT_OVERVIEW.md)、
+> [路线图](csd-experiments/ROADMAP.md)、[设备侧模块](smartssd/README.md)。
+
 
 [![Slack](https://img.shields.io/badge/slack-purple)](https://join.slack.com/t/seaweedfs/shared_invite/enQtMzI4MTMwMjU2MzA3LTEyYzZmZWYzOGQ3MDJlZWMzYmI0OTE4OTJiZjJjODBmMzUxNmYwODg0YjY3MTNlMjBmZDQ1NzQ5NDJhZWI2ZmY)
 [![Twitter](https://img.shields.io/twitter/follow/seaweedfs.svg?style=social&label=Follow)](https://twitter.com/intent/follow?screen_name=seaweedfs)

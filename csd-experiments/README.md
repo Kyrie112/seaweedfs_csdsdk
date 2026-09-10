@@ -20,6 +20,10 @@ csd-experiments/
 
 ## 内容索引
 
+### 设备侧模块
+
+- [`../smartssd/`](../smartssd/README.md):CSD agent、FPGA 内核、主机侧参考测试(已并入本仓库,`make -C smartssd test`)
+
 ### 规划
 
 - [reports/THESIS_DRAFT.md](reports/THESIS_DRAFT.md):**毕业论文初稿**(摘要/绪论/技术基础/总体设计/关键机制/图像检索算子/实验/结论)

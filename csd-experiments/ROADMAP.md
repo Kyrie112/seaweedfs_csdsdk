@@ -11,7 +11,7 @@
 | 文件/对象/块多模态计算入口 | 已完成 | `weed/server/filer_compute_api.go`、`weed/s3api/s3api_compute.go` |
 | 跨 chunk 编排与聚合(Map/Reduce) | 已完成 | `weed/server/filer_server_handlers_proxy.go` |
 | 区间描述符式近存计算协议 | 已完成 | `weed/storage/volume_read.go`(`NeedleComputeRegion`)、`weed/server/csd_compute.go` |
-| SmartSSD 常驻 agent + P2P 通路 | 已完成(设计) | `smartssd_compute_module/src/csd_agent.cpp` |
+| SmartSSD 常驻 agent + P2P 通路 | 已完成(设计) | `smartssd/src/csd_agent.cpp` |
 | CSD-aware 副本调度(能力/负载/延迟) | 已完成 | `weed/server/filer_csd_scheduler.go` |
 
 融合已经跑通,但距离一篇扎实的毕业设计还缺三样东西:

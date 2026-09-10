@@ -1,7 +1,7 @@
 """Shared helpers for the near-storage image similarity search experiment.
 
 The descriptor and distance below are the *reference* implementation of the
-device operator (see csd-agent-sim/main.go and smartssd_compute_module's
+device operator (see csd-agent-sim/main.go and smartssd/
 src/image_descriptor.h). The experiment compares the device answer against this
 implementation to prove functional equivalence.
 """

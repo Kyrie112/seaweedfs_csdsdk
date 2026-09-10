@@ -318,7 +318,7 @@
 | 本轮实验数据 | `csd-experiments/results/phase1_local.csv`、`phase1_cache_policy.csv` |
 | 本地实验台脚本 | `csd-experiments/scripts/run_phase1_local.sh` |
 | 软件 CSD agent(无 FPGA 也能跑) | `csd-experiments/tools/csd-agent-sim/` |
-| 设备侧 agent 与 FPGA 内核 | 独立仓库 `smartssd_compute_module/src/` |
+| 设备侧 agent 与 FPGA 内核 | `smartssd/src/`(已并入本仓库) |
 
 ## 8. 复现方式(给想验证的人)
 
@@ -338,7 +338,7 @@ WEED=/tmp/weed_phase1 AGENT=/tmp/csd-agent-sim MODES="direct auto" \
   ./csd-experiments/scripts/run_phase1_local.sh 64 9
 
 # 4. 设备侧(无需 FPGA 的参考测试)
-cd ../smartssd_compute_module && make test && make syntax-check
+make -C smartssd test && make -C smartssd syntax-check
 ```
 
 ## 9. 附录:术语表

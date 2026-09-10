@@ -170,10 +170,10 @@ done
 # Independent verification.
 #
 # Semantics: each chunk's result is the sum of little-endian uint64 words packed
-# from that chunk's byte 0, wrapped to 64 bits; the filer then adds the per-chunk
-# values with big.Int and deliberately does NOT wrap the aggregate. Chunk sizes
-# are multiples of 8 bytes, so a chunk's packed sum is just the sum of the uint64
-# words in its byte range.
+# from that chunk's byte 0, and the filer adds those per-chunk values *reduced
+# modulo 2^64*, so a multi-chunk request returns exactly the same value as a
+# single-chunk request over the same bytes. Chunk sizes are multiples of 8, so a
+# chunk's packed sum is the sum of the uint64 words in its byte range.
 log "independent verification against the original file"
 python3 - "$DATA_FILE" "$EXPECTED" "$LAST_CHUNKS" "$WORK/verify.txt" <<'VERIFYEOF'
 import sys
@@ -191,7 +191,8 @@ with open(path, "rb") as f:
         part = 0
         for i in range(0, len(block), 8):
             part = (part + int.from_bytes(block[i:i + 8], "little")) & MASK
-        total += part          # aggregate is not wrapped, matching big.Int
+        total += part
+        total &= MASK          # the aggregate is reduced modulo 2^64
 status = "PASS" if str(total) == reported else "FAIL"
 print(f"{status}: multi-chunk seaweedfs={reported} independent={total} "
       f"file={path} chunks={chunk_count} chunk_bytes={chunk}")

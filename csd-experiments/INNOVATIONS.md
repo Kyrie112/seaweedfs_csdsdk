@@ -79,8 +79,8 @@
 
 **代码**:
 
-- `smartssd_compute_module/src/csd_agent.cpp`
-- `smartssd_compute_module/src/file_sum64_kernel.cpp`
+- `smartssd/src/csd_agent.cpp`
+- `smartssd/src/file_sum64_kernel.cpp`
 
 ## 5. CSD-aware 副本选择策略
 
