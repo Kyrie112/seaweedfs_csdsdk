@@ -20,7 +20,7 @@
 | [`WORKFLOW.md`](WORKFLOW.md) | 单个开发步骤的标准流程(SOP)与"完成定义" |
 | [`M1-detection.md`](M1-detection.md) | 里程碑 1:可检测(快照令牌 + 设备自检 + 指标) |
 | [`M2-mitigation.md`](M2-mitigation.md) | 里程碑 2:可规避(副本一致性 + 失败语义) |
-| [`M3-exclusion.md`](M3-exclusion.md) | 里程碑 3:可互斥(卷数据文件代次 / 读租约,可选) |
+| [`M3-versioning.md`](M3-versioning.md) | 里程碑 3:版本化快照与延迟回收(核心机制,含引用计数与 GC) |
 | [`M4-verification.md`](M4-verification.md) | 里程碑 4:可验证(故障注入矩阵 + 不变量检查) |
 | [`templates/step-record.md`](templates/step-record.md) | 单步开发记录模板 |
 | [`journal/`](journal/) | 开发日志,按日期记录实际推进过程与决策 |
@@ -46,5 +46,15 @@
 
 ## 当前状态
 
-**尚未开始任何代码改动。** 本目录于 2026-10-12 建立,当前只包含流程与模板,
-所有步骤状态均为 ⬜(详见 [`PROGRESS.md`](PROGRESS.md))。
+| 里程碑 | 状态 |
+| --- | --- |
+| M1 可检测(快照令牌 + 设备自校验 + 指标) | ✅ 已完成并验证,见 [journal/2026-10-12-m1-detection.md](journal/2026-10-12-m1-detection.md) |
+| M2 可规避(副本一致性 + 失败语义) | ⬜ 未开始 |
+| M3 版本化快照与延迟回收 | ⬜ 未开始(**已从"可选"升级为核心机制**) |
+| M4 可验证(故障注入矩阵) | ⬜ 未开始 |
+
+**方案变更**:2026-10-12 决定采用"版本保留 + 引用计数 + 延迟回收"(MVCC 式)作为
+一致性的主路径——老任务读老版本、新写入追加为新版本、引用归零后 GC。
+M1 的检测能力由主路径退化为兜底。详见
+[PLAN 5.4 节](../DISTRIBUTED_CONSISTENCY_PLAN.md)与
+[journal/2026-10-12-m3-versioning-design.md](journal/2026-10-12-m3-versioning-design.md)。
