@@ -20,6 +20,10 @@ csd-experiments/
 
 ## 内容索引
 
+### 一致性
+
+- [../DISTRIBUTED_CONSISTENCY_PLAN.md](../DISTRIBUTED_CONSISTENCY_PLAN.md):分布式一致性问题的挑战分析与开发计划(挑战 C1–C7、方案 5.1–5.7、里程碑 M1–M4)
+
 ### 设备侧模块
 
 - [`../smartssd/`](../smartssd/README.md):CSD agent、FPGA 内核、主机侧参考测试(已并入本仓库,`make -C smartssd test`)
