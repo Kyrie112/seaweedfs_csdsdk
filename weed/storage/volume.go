@@ -50,6 +50,10 @@ type Volume struct {
 	isCompactionInProgress atomic.Bool
 	lastDiskCheckNs        atomic.Int64 // unix time in nanoseconds for phantom volume detection
 
+	// versions 保存 M3 的版本保留状态:当前数据文件代次,以及每个历史版本的
+	// 最近使用时间(用于延迟回收)。
+	versions versionState
+
 	volumeInfoRWLock sync.RWMutex
 	volumeInfo       *volume_server_pb.VolumeInfo
 	location         *DiskLocation
@@ -136,6 +140,7 @@ func NewVolume(dirname string, dirIdx string, collection string, id needle.Volum
 	v.needleMapKind = needleMapKind
 	v.ldbTimeout = ldbTimeout
 	e = v.load(true, true, needleMapKind, preallocate, ver)
+	v.initVersionState()
 	v.startWorker()
 	return
 }

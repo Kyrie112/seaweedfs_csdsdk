@@ -1,0 +1,9 @@
+id,scenario,expectation,http,latency_ms,verdict,note,error_class,retry_reason,body
+baseline,no fault,correct answer,200,29.28,PASS,matches snapshot A,,,"341:2945,517:3575,813:3649,277:3738,741:3756"
+F4,range reused during the read,explicit failure or a snapshot answer,200,34.96,PASS,matches snapshot A (recovered by the M2 retry),,stale_range,"341:2945,517:3575,813:3649,277:3738,741:3756"
+F1,file overwritten around the request,answer belongs to snapshot A or B,200,24.10,PASS,matches snapshot B,,,"973:3452,309:3642,85:3673,533:3701,621:3715"
+F7,one replica unavailable,"still served, or explicit failure",200,20.63,PASS,matches snapshot B (served by another replica),,,"973:3452,309:3642,85:3673,533:3701,621:3715"
+F2,file deleted while computing,explicit failure or a snapshot answer,,0.00,SKIPPED,needs a stable multi-host cluster to time the delete window,,,
+F3,compaction during compute,explicit failure or a snapshot answer,,0.00,SKIPPED,needs a volume with reclaimable garbage plus a vacuum trigger; covered by the storage-level integration test,,,
+F5,one replica lags behind,explicit failure or a snapshot answer,,0.00,SKIPPED,needs the three-host deployment to control replica progress,,,
+F6,mixed kernel/protocol versions,explicit failure or a snapshot answer,,0.00,SKIPPED,needs a rolling upgrade across hosts,,,

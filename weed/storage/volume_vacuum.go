@@ -220,6 +220,17 @@ func (v *Volume) CommitCompact() error {
 		return e
 	}
 	glog.V(3).Infof("Finish committing volume %d", v.Id)
+
+	// M3: the swap is complete, so the data file has a new identity. Bump the
+	// generation (new compute requests retain the new version) and reclaim any
+	// version that nobody has used for longer than the retention window. The
+	// version that just went out of service is kept: its "last used" timestamp is
+	// recent, so a request that is still reading it stays safe.
+	generation := v.bumpDataGeneration()
+	glog.V(1).Infof("volume %d: data generation is now %d", v.Id, generation)
+	if removed := v.GarbageCollectDataVersions(); len(removed) > 0 {
+		glog.V(1).Infof("volume %d: reclaimed %d expired data version(s)", v.Id, len(removed))
+	}
 	return nil
 }
 

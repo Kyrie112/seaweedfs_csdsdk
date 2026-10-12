@@ -41,6 +41,9 @@ type NeedleComputeRegion struct {
 	// needle meta area. Together with the needle identity it lets a replica
 	// report which data version it actually served (M2).
 	LastModified int64
+
+	// Generation is the data file generation this region belongs to (M3).
+	Generation uint64
 }
 
 // CSDReadAlignment is the read granularity a near-storage engine needs in order
@@ -128,6 +131,18 @@ func (v *Volume) NeedleComputeRegion(n *needle.Needle) (region NeedleComputeRegi
 	region.ReadOffset, region.ReadSize, region.PayloadShift =
 		ComputeAlignedWindow(region.DataOffset, region.DataSize)
 	region.LastModified = int64(n.LastModified)
+	region.Generation = v.CurrentDataGeneration()
+
+	// M3: hand the device a **retained version** of the data file instead of the
+	// live path. The hard link keeps the pre-compaction inode readable, so a
+	// compaction that happens while this request is in flight cannot change what
+	// the device reads. Falls back to the live path if the link cannot be made.
+	if versionPath, linkErr := v.ensureVersionLink(); linkErr == nil {
+		region.DataFile = versionPath
+		v.noteVersionUse(region.Generation)
+	} else {
+		glog.V(1).Infof("volume %d: compute region keeps the live data file: %v", v.Id, linkErr)
+	}
 	return region, true, nil
 }
 

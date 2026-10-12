@@ -1,0 +1,113 @@
+# 总日志:SeaweedFS + SmartSSD 一致性控制与版本回收(M1–M4 完整记录)
+
+> 覆盖 M1–M4 全部开发、测试与性能记录。
+> 分阶段日志:[M1](2026-10-12-m1-detection.md) ·
+> [M2](2026-10-12-m2-mitigation.md) · [M3](2026-10-12-m3-versioning.md) ·
+> [M4](2026-10-12-m4-verification.md)。方案依据:
+> [PLAN 5.1–5.4](../../DISTRIBUTED_CONSISTENCY_PLAN.md)。
+
+## 1. 一句话总结
+
+计算下沉把数据读取搬出了 volume 的同步域,由此产生的**静默错误**
+(读到被整理移动/被复用的数据、跨副本混版)通过四个阶段被系统性消除:
+**检测(M1)→ 自愈(M2)→ 版本保留(M3)→ 可机器判定地验证(M4)**。
+最终在本地三节点形态上,**故障注入矩阵的静默错误为 0**。
+
+## 2. 问题与方案(为什么做这四步)
+
+| 挑战 | 后果 | 对应阶段 | 结局 |
+| --- | --- | --- | --- |
+| 读取窗口内区间被移动/复用(C2/C3) | 🔴 静默错误 | M1 检测 → M2 自愈 → M3 根治 | 从"返回错误结果"到"读到正确旧版本" |
+| 元数据与数据之间的 TOCTOU(C1) | 🟠 未标注快照 | M1 快照令牌 + M2 重解析 | 结果可归属到某个版本 |
+| 副本滞后/混版(C4) | 🔴 静默错误 | M2 错误分类 + 换副本重试 | 分类为 not_found 并自动切换 |
+| 整理与在途计算互斥(C2 的根治) | 🔴 静默错误 | M3 版本保留 + 延迟回收 | 老任务读老版本,新请求读新版本 |
+| 无法证明"没有不一致" | 结论不可信 | M4 矩阵 + 不变量判据 | 静默错误可被机器判定为 0 |
+
+## 3. 各阶段做了什么(浓缩)
+
+| 阶段 | 核心机制 | 关键代码 | 验证结论 |
+| --- | --- | --- | --- |
+| **M1 可检测** | 快照令牌(`snap`/`chunk`/`csize`)、设备侧 needle 头前后自校验、一致性指标 | `filer_compute_consistency.go`、`csd_agent.cpp`、`csd-agent-sim` | 注入"读取中区间被复用"时不再返回数值(409) |
+| **M2 可规避** | 四类错误分类 + `X-CSD-Error-Class`;请求级重新解析清单 + 重试一次;副本亲和(带余量保护);`on_stale=retry\|fail` | `filer_server_handlers_proxy.go`、`filer_csd_scheduler_rank.go` | 同一注入下 **200 + 正确结果**(重试自愈);`on_stale=fail` 时 409 |
+| **M3 版本保留** | **硬链接保留数据版本** + 代次 + 最近使用登记 + 延迟回收;描述符指向版本链接 | `volume_versioning.go`、`volume_read.go`、`volume_vacuum.go` | 替换在线 `.dat` 后版本链接仍读到原始数据;超过保留期被回收,当前代次永不回收 |
+| **M4 可验证** | 故障注入矩阵 + 不变量检查器(结果必须属于某个快照) | `consistency_matrix.py`、`run_local_multinode.sh` | F1/F4/F7 + baseline 全 PASS,**静默错误 0**,4 行按原因 SKIPPED |
+
+## 4. 关键设计决策
+
+| # | 决策 | 理由 | 记录 |
+| --- | --- | --- | --- |
+| 1 | 一致性默认档取 **L1**(单块读已提交) | 以最小代价消除最危险的静默错误 | PLAN 4.1 |
+| 2 | 偏移由**设备**承担,而不是主机侧裁剪 | 打包类算子的位权随偏移改变,主机侧无法补偿(定理 1) | PLAN 4.2 |
+| 3 | 采用**版本保留 + 延迟回收**,而不是只检测失败 | 只有保留版本才能让老任务成功且结果自洽(L2) | [M3 设计日志](2026-10-12-m3-versioning-design.md) |
+| 4 | M3 用**硬链接**而非"改名保留" | 不复制数据、几乎不改整理提交路径、协议零改动 | [M3 日志](2026-10-12-m3-versioning.md) 第 2 节 |
+| 5 | 回收采用 **TTL + 版本数上限**,而非精确引用计数 | 精确引用计数需要跨节点引用表;TTL + M1 兜底已足够安全 | M3 第 3 节 |
+| 6 | 重试放在**请求级**而非块级 | 只有请求级能重新解析整份块清单 | [M2 日志](2026-10-12-m2-mitigation.md) |
+| 7 | 副本亲和带**一个数据块的余量** | 纯亲和会压垮负载均衡 | 同上 |
+
+## 5. 开发中发现的真实问题(全部已修正并留痕)
+
+| # | 问题 | 发现方式 | 修正 |
+| --- | --- | --- | --- |
+| 1 | needle 头是**大端序**,而求和打包是小端序 | 集群上正常请求全部 409(cookie 值恰好字节颠倒) | 改为大端解析 + 设备侧回归测试 |
+| 2 | `stale_range` 曾**降级到脚本路径**,会重新引入静默错误 | 注入实验返回 500"脚本不存在" | 引入哨兵错误,stale 一律显式失败 |
+| 3 | 故障注入曾是**全局开关**,污染基线阶段 | 基线阶段结果也变错 | 改为 `/v1/fault` 按次注入 |
+| 4 | 两处"无自幂"的注入设计(只改头部/只改载荷)不足以证明缺陷 | 第一次矩阵结果自相矛盾 | 改为"头 + 载荷一起换"真实模拟区间复用 |
+| 5 | 描述子改为 64 维后测试里残留越界下标 | 编译告警 | 修正为 `kDescriptorDims-1` |
+| 6 | `gofmt -w weed/server/*.go` 顺带格式化了无关文件 | 提交审查 | 还原并重做提交 |
+
+## 6. 性能汇总
+
+| 场景 | 数值 | 阶段 |
+| --- | --- | --- |
+| 正常路径时延(4096 图 / 4 分块 / 7 次中位) | 41.54 ms | M2(与 M1 的 42.83/48.74 ms 差异在噪声内) |
+| 自校验开销 | 低于噪声;理论上每块多 2 次 20 字节读(≈0.004%) | M1 |
+| 重试一次(自愈) | 20.34 ms vs 单次 11.40 ms(≈1.8×) | M2 |
+| 立即失败(`on_stale=fail`) | 8.51 ms | M2 |
+| 三节点形态计算(1024 张 / 1 分块) | 48.27 ms | M3 |
+| 版本保留的额外开销 | 每个代次一次 `os.Link`(**不复制数据**);空间代价 = 被保留的旧版本本身 | M3 |
+
+## 7. 验证汇总
+
+| 测试集 | 规模 | 结果 |
+| --- | --- | --- |
+| 服务端单元测试(计算、聚合、调度、一致性) | 含 M1 的 4 个 + M2 的 4 个新用例 | 全部通过 |
+| 存储层单元测试(M3) | 5 个 | 全部通过 |
+| 存储层集成测试(M3 核心性质) | 1 个(真实写入 → 真实描述符 → 替换文件 → 旧版本可读 → 回收) | 通过 |
+| 设备侧参考测试(`make -C smartssd test`) | 498 项 | 全部通过,无告警 |
+| 端到端一致性实验(单节点) | A/B1/B2-retry/B2-fail/C | 全部符合预期 |
+| 三节点形态 + 故障矩阵(M4) | 8 行(4 执行 / 4 跳过) | **静默错误 0** |
+
+## 8. 环境限制与未完成项
+
+| 编号 | 事项 | 原因 | 建议 |
+| --- | --- | --- | --- |
+| R10/G1 | 集群上"真实整理 → 代次前进 → 历史版本回收" | 本地无法稳定触发 vacuum | 在 tan 集群用 `weed shell` 触发并复测 |
+| R11 | 空间放大随整理频率/保留期的定标 | 需要长时间观测 | 长跑实验 |
+| R12/R14 | 精确引用计数(按请求)而非 TTL | 需要跨节点引用表 | 作为后续增强 |
+| G2 | 副本滞后(F5) | 需要三台真实主机 | 在 tan 集群执行 |
+| G3 | 灰度升级(F6) | 需要新旧二进制并存 | 在 tan 集群执行 |
+| G4 | 尾延迟与能耗 | 需要真实 SmartSSD | 与真机测试合并 |
+| — | **tan09/tan10/tan11 实机部署** | 本容器无法解析这些主机且无到 192.168.0.x 的路由 | 已提供 `deploy_csd_cluster.sh`,在有网络的机器上执行 |
+
+## 9. 交付物索引
+
+| 类别 | 位置 |
+| --- | --- |
+| 方案与挑战分析 | `DISTRIBUTED_CONSISTENCY_PLAN.md` |
+| 里程碑流程与进度 | `distributed-consistency/{README,PROGRESS,WORKFLOW,M1-*,M2-*,M3-*,M4-*}.md` |
+| 分阶段日志 | `distributed-consistency/journal/2026-10-12-{m1-detection,m2-mitigation,m3-versioning,m4-verification}.md` |
+| 本总日志 | `distributed-consistency/journal/2026-10-12-overall-summary.md` |
+| 服务端实现 | `weed/server/filer_compute_consistency.go`、`filer_server_handlers_proxy.go`、`csd_compute.go`、`filer_csd_scheduler*.go` |
+| 存储层实现 | `weed/storage/volume_versioning.go`、`volume_read.go`、`volume_vacuum.go` |
+| 设备侧实现 | `smartssd/src/{aligned_range.h,csd_agent.cpp}`、`csd-experiments/tools/csd-agent-sim/` |
+| 实验脚本 | `csd-experiments/scripts/{consistency_experiment,consistency_matrix,run_local_multinode,deploy_csd_cluster}.py|sh` |
+| 实验数据 | `csd-experiments/results/{m2_consistency,m2_perf_normal,m3_multinode,m4_matrix}.csv` |
+
+## 10. 提交记录
+
+| 提交 | 内容 |
+| --- | --- |
+| `feat(consistency): M1 detection - snapshot token, device self-check, metrics` | M1 |
+| `feat(consistency): M2 mitigation - error taxonomy, stale retry, replica affinity` | M2 |
+| `feat(consistency): M3 versioning - retained data versions with delayed reclamation` | M3 |
+| `docs(consistency): M4 matrix, multi-node verification and journals` | M4 + 日志 |

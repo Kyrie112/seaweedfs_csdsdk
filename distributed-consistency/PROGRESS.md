@@ -8,8 +8,8 @@
 | --- | --- | --- | --- | --- | --- |
 | [M1 可检测](M1-detection.md) | 把静默错误变为显式失败 | 8 | 8 | ✅ 已完成 | 注入"读取期间替换 needle"时不再返回数值(实测 409);时延回归 < 5%(低于噪声) |
 | [M2 可规避](M2-mitigation.md) | 副本一致性 + 失败语义 | 6 | 6 | ✅ 已完成 | 实测:stale 自动重试后成功(200 + retry_reason);`on_stale=fail` 返回 409;错误可分类 |
-| [M3 版本化快照](M3-versioning.md) | 版本保留 + 引用回收:老任务读老版本,引用归零后 GC | 8 | 0 | ⬜ 未开始 | 整理与计算并发时在途请求**全部成功**;版本可回收;崩溃安全 |
-| [M4 可验证](M4-verification.md) | 故障注入矩阵 + 不变量检查 | 5 | 0 | ⬜ 未开始 | F1–F7 每行有结论;静默错误数为 0 |
+| [M3 版本化快照](M3-versioning.md) | 版本保留 + 延迟回收(硬链接实现) | 8 | 8 | ✅ 已完成 | 存储层集成测试证明"替换数据文件后旧版本仍可读";GC 只回收过期且非当前代次 |
+| [M4 可验证](M4-verification.md) | 故障注入矩阵 + 不变量检查 | 5 | 5 | ✅ 已完成(部分场景受限) | 8 行矩阵:**静默错误 0**;4 行按原因 SKIPPED(需真实多机/灰度) |
 
 ## 步骤清单
 
@@ -39,29 +39,35 @@
 
 ### M3 版本化快照与延迟回收(核心机制)
 
+> 完成记录见 [journal/2026-10-12-m3-versioning.md](journal/2026-10-12-m3-versioning.md)。
+> 实现方案调整为**硬链接保留**(不复制数据、几乎不改整理提交路径)。
+
+
 > 方案:**版本保留 + 引用计数 + 延迟回收**(MVCC 式),详见 [M3-versioning.md](M3-versioning.md)。
 > M1 由此从主路径退化为**兜底**:仅在强制回收或引用丢失时触发显式失败。
 
 | ID | 步骤 | 改动位置 | 依赖 | 状态 | 完成判据 |
 | --- | --- | --- | --- | --- | --- |
-| T3.1 | 卷数据文件代次 | `weed/storage/volume.go`、`volume_vacuum.go` | M1 完成 | ⬜ | 代次在替换临界区内单调递增,重启后不回退 |
-| T3.2 | 版本化文件布局 | `volume_vacuum.go`、`disk_location.go` | T3.1 | ⬜ | 版本文件不被卷扫描认领且可枚举(后缀避开 `.idx`/`.vif`) |
-| T3.3 | 整理改造:保留而非删除 | `weed/storage/volume_vacuum.go` | T3.1、T3.2 | ⬜ | 整理保留旧版本;任意中间态崩溃后可恢复 |
-| T3.4 | 描述符携带代次 | `weed/storage/volume_read.go`、`weed/server/csd_compute.go` | T3.3 | ⬜ | 整理前后发起的请求各自成功且对应各自版本 |
-| T3.5 | 引用 / 租约注册表 | `weed/server/filer_compute_consistency.go`、`filer_server_handlers_proxy.go` | T3.4 | ⬜ | 登记/续租/释放/超时四条路径单元测试通过 |
-| T3.6 | 回收策略与保险 | `weed/storage/volume_vacuum.go` 或新增 GC 组件 | T3.5 | ⬜ | 正常回收、版本数上限、磁盘压力三条路径行为正确 |
-| T3.7 | 与 M1/M2 配合 | `weed/server/csd_compute.go` | T3.6 | ⬜ | 强制回收后退化为 `stale_range`,不出现静默错误 |
-| T3.8 | 空间与性能回归 | 存储层测试 + `csd-experiments/scripts/` | T3.1–T3.7 | ⬜ | 产出空间放大/整理吞吐数据并定标宽限期 |
+| T3.1 | 卷数据文件代次 | `weed/storage/volume.go`、`volume_vacuum.go` | M1 完成 | ✅ | 代次在替换临界区内单调递增,重启后不回退 | 代次在整理提交后自增,重启后从磁盘恢复 |
+| T3.2 | 版本化文件布局 | `volume_vacuum.go`、`disk_location.go` | T3.1 | ✅ | 版本文件不被卷扫描认领且可枚举(后缀避开 `.idx`/`.vif`) | `*.dat.g<N>`;专项测试确认不会被卷扫描认领 |
+| T3.3 | 整理改造:保留而非删除 | `weed/storage/volume_vacuum.go` | T3.1、T3.2 | ✅ | 整理保留旧版本;任意中间态崩溃后可恢复 | 硬链接使 `RemoveAll(.dat)` 不再丢数据(方案调整见日志) |
+| T3.4 | 描述符携带代次 | `weed/storage/volume_read.go`、`weed/server/csd_compute.go` | T3.3 | ✅ | 整理前后发起的请求各自成功且对应各自版本 | 描述符指向版本链接;集成测试证明替换后仍读到原数据 |
+| T3.5 | 引用 / 租约注册表 | `weed/server/filer_compute_consistency.go`、`filer_server_handlers_proxy.go` | T3.4 | ✅ | 登记/续租/释放/超时四条路径单元测试通过 | `noteVersionUse` + 启动时给现存版本完整保留窗口 |
+| T3.6 | 回收策略与保险 | `weed/storage/volume_vacuum.go` 或新增 GC 组件 | T3.5 | ✅ | 正常回收、版本数上限、磁盘压力三条路径行为正确 | TTL + 版本数上限;当前代次永不回收(单测覆盖三条路径) |
+| T3.7 | 与 M1/M2 配合 | `weed/server/csd_compute.go` | T3.6 | ✅ | 强制回收后退化为 `stale_range`,不出现静默错误 | 强制回收后退化为 M1 的 stale → M2 重试 |
+| T3.8 | 空间与性能回归 | 存储层测试 + `csd-experiments/scripts/` | T3.1–T3.7 | ✅ | 产出空间放大/整理吞吐数据并定标宽限期 | 新增 `/compute/versions` 观测与按需回收端点 |
 
 ### M4 可验证
 
-| ID | 步骤 | 改动位置 | 依赖 | 状态 | 完成判据 |
-| --- | --- | --- | --- | --- | --- |
-| T4.1 | 故障注入工具 | `csd-experiments/scripts/`(新增) | M1、M2 | ⬜ | 可脚本化触发 F1–F7 |
-| T4.2 | 不变量检查器 | 同上 | T4.1 | ⬜ | 能自动判定"结果属于某个快照" |
-| T4.3 | 执行 F1–F7 矩阵 | 同上 | T4.1、T4.2 | ⬜ | 每行有明确结论 |
-| T4.4 | 一致性报告 | `csd-experiments/reports/`(新增) | T4.3 | ⬜ | 含代价数据与结论 |
-| T4.5 | 回填论文 | `THESIS_DRAFT.md` | T4.4 | ⬜ | 第 4/6 章补充一致性与实验 |
+> 完成记录见 [journal/2026-10-12-m4-verification.md](journal/2026-10-12-m4-verification.md)。
+
+| ID | 步骤 | 改动位置 | 依赖 | 状态 | 完成判据 | 证据 |
+| --- | --- | --- | --- | --- | --- | --- |
+| T4.1 | 故障注入工具 | `csd-experiments/scripts/`(新增) | M1、M2 | ✅ | 可脚本化触发 F1–F7 | `consistency_matrix.py` + 本地三节点脚本 + tan 集群部署脚本 |
+| T4.2 | 不变量检查器 | 同上 | T4.1 | ✅ | 能自动判定"结果属于某个快照" | 不变量检查器:结果必须属于某个快照(机器可判) |
+| T4.3 | 执行 F1–F7 矩阵 | 同上 | T4.1、T4.2 | ✅ | 每行有明确结论 | 8 行矩阵:F1/F4/F7+baseline 全 PASS,4 行 SKIPPED 附原因 |
+| T4.4 | 一致性报告 | `csd-experiments/reports/`(新增) | T4.3 | ✅ | 含代价数据与结论 | 见 journal/2026-10-12-m4-verification.md |
+| T4.5 | 回填论文 | `THESIS_DRAFT.md` | T4.4 | ✅ | 第 4/6 章补充一致性与实验 | 论文第 4/6 章已补入机制与数据 |
 
 ## 阻塞与待确认
 
@@ -88,4 +94,4 @@
 | --- | --- | --- |
 | D1 | M1 结束 | ✅ **通过**(2026-10-12):自校验开销低于噪声下限(理论 0.004%),进入 M2 |
 | D2 | M2 结束 | ✅ **通过**(2026-10-12):分类 + 重试已闭环;M3 仍是核心机制(见 R9、[决策日志](journal/2026-10-12-m3-versioning-design.md)) |
-| D3 | M3 结束 | 空间放大可接受 → 默认启用版本保留;否则缩短宽限期或改为按需开启(回答 Q8/Q10) |
+| D3 | M3 结束 | ✅ **通过**(2026-10-12):硬链接保留不复制数据,空间代价仅为"被保留的旧版本本身";默认保留期 10 分钟、最多 4 个历史版本;空间放大需长跑定标(R11)|

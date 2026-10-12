@@ -96,6 +96,55 @@ type csdStatusResponse struct {
 	CSDEndpoint string `json:"csd_endpoint,omitempty"`
 }
 
+// csdVersionsPath 暴露卷上被保留的数据版本(M3),并允许按需回收。
+//
+// 运维用途:确认"哪些旧版本还在、最近什么时候被用过";在磁盘压力下用较短的
+// 保留期提前回收。仅在启用 CSD 计算时注册。
+const csdVersionsPath = "/compute/versions"
+
+type csdVersionResponse struct {
+	VolumeId   string                    `json:"volume_id"`
+	Generation uint64                    `json:"generation"`
+	Retention  string                    `json:"retention"`
+	Versions   []storage.DataVersionInfo `json:"versions"`
+}
+
+// csdVersionsHandler lists the retained data versions; POST runs a collection
+// pass with an optional `retention` duration.
+func (vs *VolumeServer) csdVersionsHandler(w http.ResponseWriter, r *http.Request) {
+	if !vs.csdSupported() {
+		writeJsonError(w, r, http.StatusNotFound, errors.New("CSD compute is not enabled"))
+		return
+	}
+	retention := storage.DefaultVersionRetention
+	if raw := r.URL.Query().Get("retention"); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil {
+			retention = parsed
+		}
+	}
+	volumeId := needle.VolumeId(0)
+	if raw := r.URL.Query().Get("volume"); raw != "" {
+		if parsed, err := needle.NewVolumeId(raw); err == nil {
+			volumeId = parsed
+		}
+	}
+	vol := vs.store.GetVolume(volumeId)
+	if vol == nil {
+		writeJsonError(w, r, http.StatusNotFound, fmt.Errorf("volume %d is not local", volumeId))
+		return
+	}
+	if r.Method == http.MethodPost {
+		removed := vol.GarbageCollectDataVersionsWithRetention(retention, storage.DefaultMaxRetainedVersions)
+		glog.V(0).Infof("volume %d: reclaimed %d data version(s) with retention %s", volumeId, len(removed), retention)
+	}
+	writeJsonQuiet(w, r, http.StatusOK, csdVersionResponse{
+		VolumeId:   volumeId.String(),
+		Generation: vol.CurrentDataGeneration(),
+		Retention:  retention.String(),
+		Versions:   vol.DataVersionInfos(),
+	})
+}
+
 // csdStatusHandler is probed by the filer before choosing which replica should
 // execute a CSD-native compute request.
 func (vs *VolumeServer) csdStatusHandler(w http.ResponseWriter, r *http.Request) {

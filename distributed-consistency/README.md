@@ -50,8 +50,10 @@
 | --- | --- |
 | M1 可检测(快照令牌 + 设备自校验 + 指标) | ✅ 已完成并验证,见 [journal/2026-10-12-m1-detection.md](journal/2026-10-12-m1-detection.md) |
 | M2 可规避(副本一致性 + 失败语义) | ✅ 已完成并验证,见 [journal/2026-10-12-m2-mitigation.md](journal/2026-10-12-m2-mitigation.md) |
-| M3 版本化快照与延迟回收 | ⬜ 未开始(**已从"可选"升级为核心机制**) |
-| M4 可验证(故障注入矩阵) | ⬜ 未开始 |
+| M3 版本化快照与延迟回收 | ✅ 已完成并验证,见 [journal/2026-10-12-m3-versioning.md](journal/2026-10-12-m3-versioning.md) |
+| M4 可验证(故障注入矩阵) | ✅ 已完成(静默错误 0;部分场景受环境限制),见 [journal/2026-10-12-m4-verification.md](journal/2026-10-12-m4-verification.md) |
+
+**总记录**:[journal/2026-10-12-overall-summary.md](journal/2026-10-12-overall-summary.md)(M1–M4 完整汇总)。
 
 **方案变更**:2026-10-12 决定采用"版本保留 + 引用计数 + 延迟回收"(MVCC 式)作为
 一致性的主路径——老任务读老版本、新写入追加为新版本、引用归零后 GC。

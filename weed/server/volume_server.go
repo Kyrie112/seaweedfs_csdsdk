@@ -146,6 +146,8 @@ func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 	adminMux.HandleFunc("/healthz", requestIDMiddleware(vs.healthzHandler))
 	adminMux.HandleFunc("/readyz", requestIDMiddleware(vs.healthzHandler))
 	adminMux.HandleFunc("/compute/status", requestIDMiddleware(vs.csdStatusHandler))
+	// M3: retained data versions (inspect + explicit reclaim).
+	adminMux.HandleFunc(csdVersionsPath, requestIDMiddleware(vs.csdVersionsHandler))
 	if signingKey == "" || enableUiAccess {
 		// only expose the volume server details for safe environments
 		adminMux.HandleFunc("/ui/index.html", requestIDMiddleware(vs.uiStatusHandler))
