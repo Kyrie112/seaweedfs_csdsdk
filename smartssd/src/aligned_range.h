@@ -129,6 +129,56 @@ inline uint64_t software_sum_legacy(const uint8_t* buffer, int64_t byte_count) {
   return software_sum_payload(buffer, byte_count, 0, byte_count);
 }
 
+// ---------------------------------------------------------------------------
+// M1 range self-check
+// ---------------------------------------------------------------------------
+//
+// Every needle payload is preceded by a fixed 20-byte header:
+//
+//   cookie(4) | needle id(8) | total size(4) | payload length(4)
+//
+// All four fields are **big endian** (the volume encodes them with
+// Uint32toBytes/Uint64toBytes, whose byte order is the opposite of the
+// little-endian word packing used by the sum kernel). The device reads this
+// header before and after the payload so that a range which was moved or reused
+// during the read is rejected instead of producing a plausible wrong result.
+
+constexpr int64_t kNeedleHeaderSize = 20;
+
+struct NeedleHeader {
+  uint32_t cookie = 0;
+  uint64_t id = 0;
+  uint32_t size = 0;
+  uint32_t payload_size = 0;
+};
+
+inline uint32_t read_be32(const uint8_t* p) {
+  return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
+         (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
+}
+
+inline uint64_t read_be64(const uint8_t* p) {
+  uint64_t value = 0;
+  for (int i = 0; i < 8; ++i) {
+    value = (value << 8) | static_cast<uint64_t>(p[i]);
+  }
+  return value;
+}
+
+inline NeedleHeader parse_needle_header(const uint8_t* raw) {
+  NeedleHeader header;
+  header.cookie = read_be32(raw);
+  header.id = read_be64(raw + 4);
+  header.size = read_be32(raw + 12);
+  header.payload_size = read_be32(raw + 16);
+  return header;
+}
+
+inline bool operator==(const NeedleHeader& a, const NeedleHeader& b) {
+  return a.cookie == b.cookie && a.id == b.id && a.size == b.size &&
+         a.payload_size == b.payload_size;
+}
+
 // read_fully_with loops until `count` bytes have been read. A single pread may
 // legally return fewer bytes than requested; treating that as success is how a
 // device silently computes over a partially filled buffer. The caller must

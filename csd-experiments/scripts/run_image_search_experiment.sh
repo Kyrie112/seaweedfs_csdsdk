@@ -14,6 +14,7 @@ IMAGES=${1:-4096}
 K=${2:-5}
 SCRIPT=${SCRIPT:-image_search_experiment.py}
 EXTRA=${EXTRA:-}
+AGENT_ARGS=${AGENT_ARGS:-}
 REPS=${REPS:-7}
 READ_MODE=${READ_MODE:-direct}
 
@@ -75,7 +76,7 @@ wait_http "http://127.0.0.1:${VOLUME_PORT}/status" 20 || { log "volume failed"; 
 FILER_PID=$!
 wait_http "http://127.0.0.1:${FILER_PORT}/" 25 || { log "filer failed"; cat "$WORK/filer.log"; exit 1; }
 
-"$AGENT" -listen="127.0.0.1:${AGENT_PORT}" -mode="$READ_MODE" > "$WORK/agent.log" 2>&1 &
+"$AGENT" -listen="127.0.0.1:${AGENT_PORT}" -mode="$READ_MODE" $AGENT_ARGS > "$WORK/agent.log" 2>&1 &
 AGENT_PID=$!
 wait_http "$AGENT_URL/v1/stats" 15 || { log "agent failed"; cat "$WORK/agent.log"; exit 1; }
 

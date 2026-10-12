@@ -97,6 +97,13 @@ int64_t elapsed_ms(const std::chrono::steady_clock::time_point& start) {
       .count();
 }
 
+// StaleRangeError means the physical range no longer belongs to the object the
+// filer planned to compute over (moved by compaction, or reused after a delete).
+// It must never be answered with a computed value.
+struct StaleRangeError : std::runtime_error {
+  explicit StaleRangeError(const std::string& what) : std::runtime_error(what) {}
+};
+
 // Counters that make the aligned path auditable from the agent log. The
 // direct_hits/direct_misses pair is the evidence that O_DIRECT is actually
 // being used for real SeaweedFS needle payloads.
@@ -108,6 +115,8 @@ struct AgentStats {
   uint64_t window_mismatches = 0;
   // Adaptive-path counters: hits are requests served from the page cache,
   // misses/partials are the ones that fell back to O_DIRECT.
+  uint64_t stale_ranges = 0;
+  uint64_t header_checks = 0;
   uint64_t cache_hits = 0;
   uint64_t cache_partial = 0;
   uint64_t cache_misses = 0;
@@ -126,6 +135,7 @@ struct ComputeOutcome {
   bool direct = false;
   bool aligned_kernel = false;
   std::string path;
+  std::string snapshot;
 };
 
 template <typename T>
@@ -250,6 +260,12 @@ std::map<std::string, std::string> json_string_map(const std::string& body,
   return out;
 }
 
+std::string param_string(const std::map<std::string, std::string>& params,
+                        const std::string& name) {
+  const auto it = params.find(name);
+  return it == params.end() ? std::string() : it->second;
+}
+
 int64_t param_int64(const std::map<std::string, std::string>& params,
                     const std::string& name, int64_t fallback) {
   const auto it = params.find(name);
@@ -329,7 +345,50 @@ class OpenClRuntime {
   int kernel_arg_count() const { return kernel_arg_count_; }
   const AgentStats& stats() const { return stats_; }
   void set_cache_policy(CachePolicy policy) { cache_policy_ = policy; }
+  void set_self_check(bool enabled) { self_check_ = enabled; }
   CachePolicy cache_policy() const { return cache_policy_; }
+
+  // Reads the fixed header that precedes the payload.
+  csd::NeedleHeader read_needle_header(int fd, int64_t payload_offset) {
+    if (payload_offset < csd::kNeedleHeaderSize) {
+      throw StaleRangeError("payload offset " + std::to_string(payload_offset) +
+                            " has no room for a needle header");
+    }
+    uint8_t raw[csd::kNeedleHeaderSize];
+    const ssize_t got = csd::read_fully_at(fd, raw, csd::kNeedleHeaderSize,
+                                           payload_offset - csd::kNeedleHeaderSize);
+    if (got != csd::kNeedleHeaderSize) {
+      throw StaleRangeError("cannot read the needle header at offset " +
+                            std::to_string(payload_offset - csd::kNeedleHeaderSize));
+    }
+    return csd::parse_needle_header(raw);
+  }
+
+  // Validates the header against what the volume told us to expect.
+  csd::NeedleHeader validate_needle_header(int fd, const ComputeRequest& req) {
+    const csd::NeedleHeader header = read_needle_header(fd, req.offset);
+    const auto cookie = req.params.find("ncookie");
+    if (cookie != req.params.end() && !cookie->second.empty() &&
+        std::strtoul(cookie->second.c_str(), nullptr, 10) != header.cookie) {
+      throw StaleRangeError("cookie mismatch at offset " + std::to_string(req.offset) +
+                            " (expected " + cookie->second + ", found " +
+                            std::to_string(header.cookie) + ")");
+    }
+    const auto needle_id = req.params.find("nid");
+    if (needle_id != req.params.end() && !needle_id->second.empty() &&
+        std::strtoull(needle_id->second.c_str(), nullptr, 10) != header.id) {
+      throw StaleRangeError("needle id mismatch at offset " + std::to_string(req.offset));
+    }
+    const auto expected_size = req.params.find("csize");
+    if (expected_size != req.params.end() && !expected_size->second.empty() &&
+        std::strtoll(expected_size->second.c_str(), nullptr, 10) !=
+            static_cast<int64_t>(header.payload_size)) {
+      throw StaleRangeError("payload size mismatch at offset " + std::to_string(req.offset) +
+                            " (expected " + expected_size->second + ", found " +
+                            std::to_string(header.payload_size) + ")");
+    }
+    return header;
+  }
 
   // Runs one compute request and reports the device-side cost breakdown.
   ComputeOutcome sum_range(const ComputeRequest& req) {
@@ -479,6 +538,17 @@ class OpenClRuntime {
       }
     }
 
+    // M1: the range must still belong to the needle the volume resolved.
+    csd::NeedleHeader header_before;
+    if (self_check_) {
+      try {
+        header_before = validate_needle_header(fd, req);
+      } catch (const StaleRangeError&) {
+        ++stats_.stale_ranges;
+        throw;
+      }
+    }
+
     const auto read_start = std::chrono::steady_clock::now();
     ssize_t got = 0;
     if (served_from_cache) {
@@ -502,6 +572,28 @@ class OpenClRuntime {
     }
     outcome.read_ms = elapsed_ms(read_start);
     outcome.read_bytes = got;
+
+    if (self_check_) {
+      // Re-read the header: a change means the range was moved or reused while
+      // the payload was being read, so the bytes just read must be discarded.
+      csd::NeedleHeader header_after;
+      bool changed = false;
+      try {
+        header_after = read_needle_header(fd, req.offset);
+      } catch (const StaleRangeError&) {
+        changed = true;
+      }
+      ++stats_.header_checks;
+      if (changed || !(header_after == header_before)) {
+        ++stats_.stale_ranges;
+        if (fd_direct >= 0) {
+          ::close(fd_direct);
+        }
+        ::close(fd);
+        throw StaleRangeError("needle header changed during the read at offset " +
+                              std::to_string(req.offset));
+      }
+    }
     if (fd_direct >= 0) {
       ::close(fd_direct);
     }
@@ -565,6 +657,7 @@ class OpenClRuntime {
     OCL_CHECK(err, err = queue_->finish());
     outcome.kernel_ms = elapsed_ms(kernel_start);
     outcome.result = std::to_string(result[0]);
+    outcome.snapshot = param_string(req.params, "snap");
     return outcome;
   }
 
@@ -575,6 +668,7 @@ class OpenClRuntime {
   std::unique_ptr<cl::Program> program_;
   int kernel_arg_count_ = 0;
   CachePolicy cache_policy_ = CachePolicy::Auto;
+  bool self_check_ = true;
   AgentStats stats_;
 };
 
@@ -652,14 +746,17 @@ void handle_client(int client_fd, OpenClRuntime& runtime) {
     }
     const std::string body = raw.substr(body_start, content_length);
     if (raw.rfind("POST ", 0) == 0 && raw.find("/v1/compute") != std::string::npos) {
+      std::string request_snapshot;
       try {
         const ComputeRequest req = parse_request(body);
+        request_snapshot = param_string(req.params, "snap");
         const ComputeOutcome outcome = runtime.sum_range(req);
         std::ostringstream response;
         response << "{\"result\":\"" << outcome.result << "\""
                  << ",\"read_ms\":" << outcome.read_ms
                  << ",\"kernel_ms\":" << outcome.kernel_ms
                  << ",\"direct\":" << (outcome.direct ? "true" : "false")
+                 << ",\"snapshot\":\"" << outcome.snapshot << "\""
                  << ",\"path\":\"" << outcome.path << "\""
                  << ",\"probe_ms\":" << outcome.probe_ms
                  << ",\"aligned_kernel\":"
@@ -681,8 +778,15 @@ void handle_client(int client_fd, OpenClRuntime& runtime) {
                   << " short_reads=" << stats.short_reads
                   << " cache_hits=" << stats.cache_hits
                   << " cache_misses=" << stats.cache_misses
-                  << " cache_partial=" << stats.cache_partial << "\n";
+                  << " cache_partial=" << stats.cache_partial
+                  << " stale_ranges=" << stats.stale_ranges
+                  << " header_checks=" << stats.header_checks << "\n";
         respond(client_fd, 200, response.str());
+      } catch (const StaleRangeError& e) {
+        // Detectable inconsistency: the caller must not receive a value.
+        respond(client_fd, 409,
+                "{\"error\":\"" + std::string(e.what()) +
+                    "\",\"stale\":true,\"snapshot\":\"" + request_snapshot + "\"}");
       } catch (const std::exception& e) {
         respond(client_fd, 500, "{\"error\":\"" + std::string(e.what()) + "\"}");
       }
@@ -700,12 +804,15 @@ int main(int argc, char** argv) {
   std::string xclbin;
   std::string listen = "127.0.0.1:18090";
   std::string cache_policy = "auto";
+  bool self_check = true;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg.rfind("--xclbin=", 0) == 0) {
       xclbin = arg.substr(9);
     } else if (arg.rfind("--listen=", 0) == 0) {
       listen = arg.substr(9);
+    } else if (arg.rfind("--self-check=", 0) == 0) {
+      self_check = arg.substr(13) != "false";
     } else if (arg.rfind("--cache-policy=", 0) == 0) {
       cache_policy = arg.substr(15);
     } else {
@@ -721,6 +828,8 @@ int main(int argc, char** argv) {
 
   try {
     OpenClRuntime runtime(xclbin);
+    runtime.set_self_check(self_check);
+    std::cerr << "csd_agent: self_check=" << (self_check ? "on" : "off") << "\n";
     if (cache_policy == "direct") {
       runtime.set_cache_policy(CachePolicy::Direct);
     } else if (cache_policy == "buffered") {

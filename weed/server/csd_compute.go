@@ -55,6 +55,10 @@ type csdComputeResponse struct {
 	KernelMs int64  `json:"kernel_ms,omitempty"`
 	Direct   bool   `json:"direct,omitempty"`
 	Path     string `json:"path,omitempty"`
+
+	// Snapshot 是设备回显的快照摘要;Stale 表示设备侧判定区间已失效。
+	Snapshot string `json:"snapshot,omitempty"`
+	Stale    bool   `json:"stale,omitempty"`
 }
 
 // csdComputeTiming is the device-side cost breakdown of one CSD compute call.
@@ -63,6 +67,8 @@ type csdComputeTiming struct {
 	ReadMs   int64
 	KernelMs int64
 	Path     string
+	Snapshot string
+	Stale    bool
 }
 
 // Response headers used to carry device-side timings back through the volume
@@ -137,8 +143,32 @@ func (vs *VolumeServer) tryHandleCSDCompute(
 		return false
 	}
 
-	result, timing, err := vs.callCSDCompute(r.Context(), operation, region, csdOperatorParams(r))
+	params := csdOperatorParams(r, n)
+
+	// T1.4 一致性前置校验:filer 期望的该块长度必须与本地 needle 的数据长度一致。
+	// 不一致意味着"描述符生成之后数据被改写/替换",此时**不能**降级到脚本路径
+	// (那会算到另一份数据),必须显式失败并让上层决定是否重试。
+	if expected, ok := params[computeParamChunkSize]; ok {
+		if want, parseErr := strconv.ParseInt(expected, 10, 64); parseErr == nil && want != region.DataSize {
+			glog.Warningf("CSD compute %q volume %d needle %d: %s: filer expects %d bytes, needle has %d",
+				operation, volumeId, n.Id, staleRangeErrorCode, want, region.DataSize)
+			writeJsonError(w, r, http.StatusConflict, fmt.Errorf(
+				"%s: chunk size changed (filer expects %d bytes, needle %d now holds %d)",
+				staleRangeErrorCode, want, n.Id, region.DataSize))
+			return true
+		}
+	}
+
+	result, timing, err := vs.callCSDCompute(r.Context(), operation, region, params)
 	if err != nil {
+		if errors.Is(err, errStaleRange) {
+			// Detectable inconsistency: report it instead of falling back, so a
+			// configured compute script cannot silently compute over changed data.
+			glog.Warningf("CSD compute %q volume %d needle %d rejected: %v", operation, volumeId, n.Id, err)
+			w.Header().Set(csdHeaderStaleRange, "true")
+			writeJsonError(w, r, http.StatusConflict, err)
+			return true
+		}
 		glog.Warningf("CSD compute %q volume %d needle %d: %v", operation, volumeId, n.Id, err)
 		return false
 	}
@@ -151,6 +181,10 @@ func (vs *VolumeServer) tryHandleCSDCompute(
 	if timing.Path != "" {
 		w.Header().Set(csdHeaderPath, timing.Path)
 	}
+	if timing.Snapshot != "" {
+		w.Header().Set(consistencyHeaderSnapshot, timing.Snapshot)
+	}
+	w.Header().Set(csdHeaderStaleRange, strconv.FormatBool(timing.Stale))
 	if _, err := w.Write(result); err != nil {
 		glog.V(2).Infof("CSD compute response write error: %v", err)
 	}
@@ -165,14 +199,22 @@ func (vs *VolumeServer) tryHandleCSDCompute(
 // compute request, excluding the operation selector itself. They are forwarded
 // verbatim to the device so new operators can be added without touching the
 // volume server.
-func csdOperatorParams(r *http.Request) map[string]string {
+//
+// The needle identity is added here (not by the client): the device uses it to
+// verify that the bytes it is about to read still belong to the object the
+// filer planned to compute over.
+func csdOperatorParams(r *http.Request, n *needle.Needle) map[string]string {
 	query := r.URL.Query()
-	params := make(map[string]string, len(query))
+	params := make(map[string]string, len(query)+2)
 	for name, values := range query {
 		if name == volumeComputeQuery || len(values) == 0 {
 			continue
 		}
 		params[name] = values[0]
+	}
+	if n != nil {
+		params[computeParamNeedleCookie] = strconv.FormatUint(uint64(n.Cookie), 10)
+		params[computeParamNeedleId] = strconv.FormatUint(uint64(n.Id), 10)
 	}
 	if len(params) == 0 {
 		return nil
@@ -218,6 +260,12 @@ func (vs *VolumeServer) callCSDCompute(ctx context.Context, operation string, re
 		return nil, csdComputeTiming{}, fmt.Errorf("csd agent response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
+		// The agent reports a detectable inconsistency with 409 + stale=true.
+		var agentErr csdComputeResponse
+		if json.Unmarshal(raw, &agentErr) == nil && (agentErr.Stale || resp.StatusCode == http.StatusConflict) {
+			return nil, csdComputeTiming{Stale: true, Snapshot: agentErr.Snapshot},
+				fmt.Errorf("%w: %s", errStaleRange, agentErr.Error)
+		}
 		return nil, csdComputeTiming{}, fmt.Errorf("csd agent status %d: %s", resp.StatusCode, string(raw))
 	}
 	var parsed csdComputeResponse
@@ -225,6 +273,10 @@ func (vs *VolumeServer) callCSDCompute(ctx context.Context, operation string, re
 		return nil, csdComputeTiming{}, fmt.Errorf("csd agent bad json: %w", err)
 	}
 	if parsed.Error != "" {
+		if parsed.Stale {
+			return nil, csdComputeTiming{Stale: true, Snapshot: parsed.Snapshot},
+				fmt.Errorf("%w: %s", errStaleRange, parsed.Error)
+		}
 		return nil, csdComputeTiming{}, errors.New(parsed.Error)
 	}
 	timing := csdComputeTiming{
@@ -232,6 +284,8 @@ func (vs *VolumeServer) callCSDCompute(ctx context.Context, operation string, re
 		ReadMs:   parsed.ReadMs,
 		KernelMs: parsed.KernelMs,
 		Path:     parsed.Path,
+		Snapshot: parsed.Snapshot,
+		Stale:    parsed.Stale,
 	}
 	return []byte(parsed.Result), timing, nil
 }

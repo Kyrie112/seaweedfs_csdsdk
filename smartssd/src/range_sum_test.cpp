@@ -285,7 +285,7 @@ int main() {
     int32_t query[csd::kDescriptorDims];
     csd::image_descriptor(gallery.data() + 17 * csd::kImageRecordSize, query);
     query[0] += 3;
-    query[64] -= 2;
+    query[csd::kDescriptorDims - 1] -= 2;
 
     const std::string full = csd::image_topk(gallery.data(), 0,
                                              static_cast<int64_t>(gallery.size()),
@@ -315,6 +315,31 @@ int main() {
                         query, 5);
     check(one_and_a_half == one_record,
           "a trailing partial record must be ignored, got " + one_and_a_half);
+  }
+
+  // 10. Needle header parsing (M1 self-check). The fields are big endian — a
+  //     regression guard, because reading them as little endian compiles fine
+  //     but rejects every real request.
+  {
+    const uint8_t raw[csd::kNeedleHeaderSize] = {
+        0xB1, 0xA1, 0x1A, 0x92,                          // cookie
+        0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05,  // needle id
+        0x00, 0x20, 0x00, 0x29,                          // total size
+        0x00, 0x20, 0x00, 0x00,                          // payload size
+    };
+    const csd::NeedleHeader header = csd::parse_needle_header(raw);
+    check(header.cookie == 0xB1A11A92u, "needle header: cookie is big endian");
+    check(header.id == 0x0000000102030405ull, "needle header: needle id is big endian");
+    check(header.size == 0x00200029u, "needle header: total size is big endian");
+    check(header.payload_size == 0x00200000u, "needle header: payload size is big endian");
+
+    csd::NeedleHeader changed = header;
+    changed.cookie ^= 0xFFFFFFFFu;
+    check(!(changed == header), "needle header: a changed cookie compares unequal");
+    changed = header;
+    changed.payload_size += 1;
+    check(!(changed == header), "needle header: a changed payload size compares unequal");
+    check(header == csd::parse_needle_header(raw), "needle header: parsing is deterministic");
   }
 
   if (failures == 0) {

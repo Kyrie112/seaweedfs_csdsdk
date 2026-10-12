@@ -35,6 +35,7 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -110,6 +111,35 @@ type computeResponse struct {
 	ReadBytes int64  `json:"read_bytes,omitempty"`
 	Path      string `json:"path,omitempty"`
 	ProbeMs   int64  `json:"probe_ms,omitempty"`
+
+	// Snapshot echoes the token from the request; Stale marks a range that no
+	// longer belongs to the object the filer planned to compute over.
+	Snapshot string `json:"snapshot,omitempty"`
+	Stale    bool   `json:"stale,omitempty"`
+}
+
+// needleHeader mirrors the fixed 20-byte SeaweedFS needle header that precedes
+// every payload: cookie(4) | needle id(8) | size(4) | data size(4). All fields
+// are **big endian** — they are encoded with util.Uint32toBytes / Uint64toBytes,
+// whose byte order is the opposite of the little-endian word packing used by the
+// sum kernel. Mixing the two is exactly the kind of mistake this self-check
+// exists to catch.
+const needleHeaderSize = 20
+
+type needleHeader struct {
+	cookie   uint32
+	id       uint64
+	size     uint32
+	dataSize uint32
+}
+
+func parseNeedleHeader(raw []byte) needleHeader {
+	return needleHeader{
+		cookie:   binary.BigEndian.Uint32(raw[0:4]),
+		id:       binary.BigEndian.Uint64(raw[4:12]),
+		size:     binary.BigEndian.Uint32(raw[12:16]),
+		dataSize: binary.BigEndian.Uint32(raw[16:20]),
+	}
 }
 
 type window struct {
@@ -289,6 +319,57 @@ func searchTopK(payload []byte, base, size, recordSize int64, query *[descriptor
 	return strings.Join(hits, ","), nil
 }
 
+// readNeedleHeader reads the fixed header that precedes the payload.
+func readNeedleHeader(fd int, payloadOffset int64) (needleHeader, error) {
+	if payloadOffset < needleHeaderSize {
+		return needleHeader{}, fmt.Errorf("payload offset %d has no header before it", payloadOffset)
+	}
+	var raw [needleHeaderSize]byte
+	got, err := readFullyAt(fd, raw[:], payloadOffset-needleHeaderSize)
+	if err != nil {
+		return needleHeader{}, err
+	}
+	if got != needleHeaderSize {
+		return needleHeader{}, fmt.Errorf("short header read: got %d of %d bytes", got, needleHeaderSize)
+	}
+	return parseNeedleHeader(raw[:]), nil
+}
+
+// validateNeedleHeader is the M1 range self-check: the bytes about to be read
+// must still belong to the needle the volume resolved. A mismatch means the
+// physical range was reused or moved, which would otherwise yield a plausible
+// but wrong result.
+func (a *agent) validateNeedleHeader(fd int, req computeRequest, tamper bool) (needleHeader, error) {
+	header, err := readNeedleHeader(fd, req.Offset)
+	if err != nil {
+		return needleHeader{}, fmt.Errorf("stale_range: %w", err)
+	}
+	if tamper {
+		// Simulate "the needle at this offset was replaced".
+		header.cookie ^= 0xFFFFFFFF
+	}
+
+	if want := req.Params["ncookie"]; want != "" {
+		if expected, convErr := strconv.ParseUint(want, 10, 32); convErr == nil && uint32(expected) != header.cookie {
+			return needleHeader{}, fmt.Errorf("stale_range: cookie mismatch at offset %d (want %d, found %d)",
+				req.Offset, expected, header.cookie)
+		}
+	}
+	if want := req.Params["nid"]; want != "" {
+		if expected, convErr := strconv.ParseUint(want, 10, 64); convErr == nil && expected != header.id {
+			return needleHeader{}, fmt.Errorf("stale_range: needle id mismatch at offset %d (want %d, found %d)",
+				req.Offset, expected, header.id)
+		}
+	}
+	if want := req.Params["csize"]; want != "" {
+		if expected, convErr := strconv.ParseInt(want, 10, 64); convErr == nil && expected != int64(header.dataSize) {
+			return needleHeader{}, fmt.Errorf("stale_range: data size mismatch at offset %d (want %d, found %d)",
+				req.Offset, expected, header.dataSize)
+		}
+	}
+	return header, nil
+}
+
 func paramInt(params map[string]string, name string, fallback int) int {
 	raw := params[name]
 	if raw == "" {
@@ -314,19 +395,29 @@ func paramInt64(params map[string]string, name string, fallback int64) int64 {
 }
 
 type agent struct {
-	mode      readMode
-	evict     bool
-	mu        sync.Mutex
-	last      computeRequest
-	requests  int64
-	directHi  int64
-	directLo  int64
-	short     int64
-	readBy    int64
-	cacheHit  int64
-	cachePart int64
-	cacheMiss int64
-	probeErr  int64
+	mode  readMode
+	evict bool
+	// selfCheck enables the M1 range self-check (needle header verified before
+	// and after the payload read). It can be turned off to measure its cost.
+	selfCheck bool
+	// Fault injection state, armed on demand through POST /v1/fault so that only
+	// the request under test is affected (a global switch would corrupt the
+	// baseline phases of the experiment as well).
+	faultMode      string
+	faultRemaining int
+	mu             sync.Mutex
+	last           computeRequest
+	requests       int64
+	directHi       int64
+	directLo       int64
+	short          int64
+	readBy         int64
+	cacheHit       int64
+	cachePart      int64
+	cacheMiss      int64
+	probeErr       int64
+	staleRanges    int64
+	headerChecks   int64
 }
 
 func (a *agent) handleCompute(w http.ResponseWriter, r *http.Request) {
@@ -428,6 +519,24 @@ func (a *agent) run(req computeRequest) (computeResponse, int) {
 		}
 	}
 
+	// Fault injection is armed per request so baseline phases stay clean.
+	fault := a.nextFault()
+
+	// M1: verify before the read that the range still belongs to the needle the
+	// volume resolved, and verify again afterwards that it did not change.
+	var headerBefore needleHeader
+	if a.selfCheck {
+		validated, err := a.validateNeedleHeader(fd, req, fault == "tamper-header")
+		if err != nil {
+			a.mu.Lock()
+			a.staleRanges++
+			a.mu.Unlock()
+			return computeResponse{Error: err.Error(), Stale: true, Snapshot: req.Params["snap"]},
+				http.StatusConflict
+		}
+		headerBefore = validated
+	}
+
 	readStart := time.Now()
 	var got int
 	var readErr error
@@ -477,6 +586,40 @@ func (a *agent) run(req computeRequest) (computeResponse, int) {
 		}
 	}
 	readMs := time.Since(readStart).Milliseconds()
+
+	if fault == "mutate-on-read" {
+		// Simulate a concurrent reuse of the physical range: the bytes just read
+		// actually belonged to another object. The post-read header check below
+		// also sees a changed cookie, which is what a real reuse produces.
+		for i := w.payloadShift; i < w.payloadShift+req.Size && i < int64(len(buf.slice)); i++ {
+			buf.slice[i] = 0
+		}
+	}
+
+	if a.selfCheck {
+		headerAfter, err := readNeedleHeader(fd, req.Offset)
+		if fault == "mutate-on-read" {
+			headerAfter.cookie ^= 0xFFFFFFFF
+		}
+		a.mu.Lock()
+		a.headerChecks++
+		a.mu.Unlock()
+		if err != nil || headerAfter != headerBefore {
+			a.mu.Lock()
+			a.staleRanges++
+			a.mu.Unlock()
+			if directFD >= 0 {
+				syscall.Close(directFD)
+			}
+			syscall.Close(fd)
+			return computeResponse{
+				Error:    fmt.Sprintf("stale_range: needle header changed during the read at offset %d", req.Offset),
+				Stale:    true,
+				Snapshot: req.Params["snap"],
+			}, http.StatusConflict
+		}
+	}
+
 	if directFD >= 0 {
 		syscall.Close(directFD)
 	}
@@ -556,6 +699,7 @@ func (a *agent) run(req computeRequest) (computeResponse, int) {
 		ReadBytes: int64(got),
 		Path:      path,
 		ProbeMs:   probeMs,
+		Snapshot:  req.Params["snap"],
 	}, http.StatusOK
 }
 
@@ -574,7 +718,47 @@ func (a *agent) handleStats(w http.ResponseWriter, _ *http.Request) {
 		"cache_partial": a.cachePart,
 		"cache_misses":  a.cacheMiss,
 		"probe_errors":  a.probeErr,
+		"stale_ranges":  a.staleRanges,
+		"header_checks": a.headerChecks,
+		"self_check":    a.selfCheck,
+		"fault_mode":    a.faultMode,
 	})
+}
+
+// nextFault consumes one armed fault, if any.
+func (a *agent) nextFault() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.faultMode == "" || a.faultRemaining == 0 {
+		return ""
+	}
+	if a.faultRemaining > 0 {
+		a.faultRemaining--
+	}
+	return a.faultMode
+}
+
+// handleFault arms the fault injection for the next N requests (experiment
+// harness only; the production agent has no such endpoint).
+func (a *agent) handleFault(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	mode := query.Get("mode")
+	count := 1
+	if raw := query.Get("count"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			count = parsed
+		}
+	}
+	a.mu.Lock()
+	switch mode {
+	case "clear", "":
+		a.faultMode, a.faultRemaining = "", 0
+	default:
+		a.faultMode, a.faultRemaining = mode, count
+	}
+	state := map[string]any{"mode": a.faultMode, "remaining": a.faultRemaining}
+	a.mu.Unlock()
+	writeJSON(w, http.StatusOK, state)
 }
 
 func (a *agent) handleLast(w http.ResponseWriter, _ *http.Request) {
@@ -598,6 +782,7 @@ func main() {
 	listen := flag.String("listen", "127.0.0.1:18090", "listen address")
 	mode := flag.String("mode", string(modeDirect), "read path: legacy|aligned|direct")
 	evict := flag.Bool("evict", false, "drop the data file from the page cache before each read (cold-cache measurement)")
+	selfCheck := flag.Bool("self-check", true, "verify the needle header before and after the payload read (M1)")
 	flag.Parse()
 
 	selected := readMode(*mode)
@@ -608,11 +793,16 @@ func main() {
 		os.Exit(2)
 	}
 
-	a := &agent{mode: selected, evict: *evict}
+	a := &agent{
+		mode:      selected,
+		evict:     *evict,
+		selfCheck: *selfCheck,
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/compute", a.handleCompute)
 	mux.HandleFunc("/v1/stats", a.handleStats)
 	mux.HandleFunc("/v1/last", a.handleLast)
+	mux.HandleFunc("/v1/fault", a.handleFault)
 
 	log.Printf("csd-agent-sim ready on %s mode=%s", *listen, selected)
 	if err := http.ListenAndServe(*listen, mux); err != nil {
