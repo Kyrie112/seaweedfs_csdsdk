@@ -2,6 +2,7 @@
 
 > 状态:**分析文档,暂不实施**(本文件只描述问题、方案与开发流程)
 > 适用范围:本仓库的服务端计算下沉路径(`weed/server`、`weed/storage`)与设备侧 CSD agent(`smartssd/`)
+> 执行记录:[distributed-consistency/](distributed-consistency/README.md)(每步开发流程与验证证据)
 > 关联文档:[论文初稿](csd-experiments/reports/THESIS_DRAFT.md)、[阶段一验证报告](csd-experiments/reports/REPORT_PHASE1_HARDENING.md)、[路线图](csd-experiments/ROADMAP.md)
 
 ## 0. 结论摘要

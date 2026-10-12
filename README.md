@@ -14,7 +14,7 @@
 > | `csd-experiments/reports/` | 论文初稿、阶段验证报告、项目总览 |
 > | `csd-experiments/results/` | 全部实验原始数据 |
 >
-> 一致性设计:[分布式一致性问题分析与开发计划](DISTRIBUTED_CONSISTENCY_PLAN.md)
+> 一致性设计:[分布式一致性问题分析与开发计划](DISTRIBUTED_CONSISTENCY_PLAN.md)(开发过程记录见 [distributed-consistency/](distributed-consistency/README.md))
 >
 > 快速入口:[论文初稿](csd-experiments/reports/THESIS_DRAFT.md)、
 > [项目总览](csd-experiments/reports/REPORT_PROJECT_OVERVIEW.md)、
