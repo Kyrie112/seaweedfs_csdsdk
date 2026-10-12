@@ -40,7 +40,7 @@ func (fs *FilerServer) rankComputeReplicas(ctx context.Context, urlStrings []str
 	candidates := fs.probeReplicaCapabilities(ctx, urlStrings)
 
 	fs.csdSchedMu.Lock()
-	ranked := rankCandidates(candidates, fs.csdLoadOfLocked, nil)
+	ranked := rankCandidates(candidates, fs.csdLoadOfLocked, nil, nil, 0)
 	fs.csdSchedMu.Unlock()
 
 	return csdCandidateURLs(ranked)
@@ -116,7 +116,7 @@ func (fs *FilerServer) probeCSDStatus(ctx context.Context, statusURL string, out
 //
 // The returned release function must be called when the attempt finishes, on
 // both the success and the failure path.
-func (fs *FilerServer) rankAndReserve(ctx context.Context, urlStrings []string, weightBytes int64, exclude map[string]struct{}) (string, func(), error) {
+func (fs *FilerServer) rankAndReserve(ctx context.Context, urlStrings []string, weightBytes int64, exclude map[string]struct{}, preferred *hostPreference) (string, func(), error) {
 	candidates := fs.probeReplicaCapabilities(ctx, urlStrings)
 	if weightBytes <= 0 {
 		weightBytes = 1
@@ -129,7 +129,7 @@ func (fs *FilerServer) rankAndReserve(ctx context.Context, urlStrings []string, 
 	if fs.csdInflightReqs == nil {
 		fs.csdInflightReqs = make(map[string]int64)
 	}
-	ranked := rankCandidates(candidates, fs.csdLoadOfLocked, exclude)
+	ranked := rankCandidates(candidates, fs.csdLoadOfLocked, exclude, preferred.has, weightBytes)
 	if len(ranked) == 0 {
 		fs.csdSchedMu.Unlock()
 		if len(exclude) > 0 {

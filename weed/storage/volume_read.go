@@ -36,6 +36,11 @@ type NeedleComputeRegion struct {
 	ReadOffset   int64
 	ReadSize     int64
 	PayloadShift int64
+
+	// LastModified is the needle's own modification time as recorded in the
+	// needle meta area. Together with the needle identity it lets a replica
+	// report which data version it actually served (M2).
+	LastModified int64
 }
 
 // CSDReadAlignment is the read granularity a near-storage engine needs in order
@@ -122,6 +127,7 @@ func (v *Volume) NeedleComputeRegion(n *needle.Needle) (region NeedleComputeRegi
 	}
 	region.ReadOffset, region.ReadSize, region.PayloadShift =
 		ComputeAlignedWindow(region.DataOffset, region.DataSize)
+	region.LastModified = int64(n.LastModified)
 	return region, true, nil
 }
 

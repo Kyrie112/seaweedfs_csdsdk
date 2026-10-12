@@ -48,7 +48,7 @@ func TestRankAndReserveSkipsExcludedReplicas(t *testing.T) {
 		csdHostOf(first.URL):  {},
 		csdHostOf(second.URL): {},
 	}
-	chosen, release, err := fs.rankAndReserve(context.Background(), urls, 4096, excluded)
+	chosen, release, err := fs.rankAndReserve(context.Background(), urls, 4096, excluded, nil)
 	if err != nil {
 		t.Fatalf("rankAndReserve with exclusions: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestRankAndReserveFailsWhenAllReplicasExcluded(t *testing.T) {
 	fs := newSchedulerTestFiler()
 
 	excluded := map[string]struct{}{csdHostOf(only.URL): {}}
-	if _, _, err := fs.rankAndReserve(context.Background(), []string{only.URL}, 4096, excluded); err == nil {
+	if _, _, err := fs.rankAndReserve(context.Background(), []string{only.URL}, 4096, excluded, nil); err == nil {
 		t.Fatal("expected an error when every replica has been excluded, got nil")
 	}
 }
@@ -111,7 +111,7 @@ func TestRankAndReserveReleasesByteLoad(t *testing.T) {
 	fs := newSchedulerTestFiler()
 	const weight = int64(8 << 20)
 
-	_, release, err := fs.rankAndReserve(context.Background(), []string{only.URL}, weight, nil)
+	_, release, err := fs.rankAndReserve(context.Background(), []string{only.URL}, weight, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +163,7 @@ func TestRankAndReserveDoesNotSerializeCapabilityProbes(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, release, err := fs.rankAndReserve(context.Background(), []string{srv.URL}, 1024, nil)
+			_, release, err := fs.rankAndReserve(context.Background(), []string{srv.URL}, 1024, nil, nil)
 			if err != nil {
 				t.Errorf("rankAndReserve: %v", err)
 				return

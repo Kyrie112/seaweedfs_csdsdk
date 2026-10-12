@@ -69,7 +69,8 @@ func (fs *FilerServer) probeReplicaCapabilities(ctx context.Context, urlStrings 
 // in fetchChunkComputeResult meaningful: every retry is guaranteed to target a
 // replica that has not failed yet, instead of re-ranking the same broken one
 // back to the front.
-func rankCandidates(candidates []csdCandidate, loadOf func(host string) csdLoad, exclude map[string]struct{}) []csdCandidate {
+func rankCandidates(candidates []csdCandidate, loadOf func(host string) csdLoad, exclude map[string]struct{},
+	preferred func(host string) bool, loadMargin int64) []csdCandidate {
 	ranked := make([]csdCandidate, 0, len(candidates))
 	for _, candidate := range candidates {
 		if exclude != nil {
@@ -80,10 +81,32 @@ func rankCandidates(candidates []csdCandidate, loadOf func(host string) csdLoad,
 		ranked = append(ranked, candidate)
 	}
 
+	// Request-level affinity: prefer hosts this request already used, but only
+	// while their load stays within one chunk of the least loaded candidate, so
+	// the preference cannot wreck load balancing.
+	minBytes := int64(0)
+	if loadOf != nil {
+		for index, candidate := range ranked {
+			load := loadOf(candidate.Host)
+			if index == 0 || load.Bytes < minBytes {
+				minBytes = load.Bytes
+			}
+		}
+	}
+	affinity := func(host string) bool {
+		if preferred == nil || !preferred(host) || loadOf == nil {
+			return false
+		}
+		return loadOf(host).Bytes <= minBytes+loadMargin
+	}
+
 	sort.SliceStable(ranked, func(i, j int) bool {
 		a, b := ranked[i], ranked[j]
 		if a.CSDEnabled != b.CSDEnabled {
 			return a.CSDEnabled
+		}
+		if aPref, bPref := affinity(a.Host), affinity(b.Host); aPref != bPref {
+			return aPref
 		}
 		var loadA, loadB csdLoad
 		if loadOf != nil {

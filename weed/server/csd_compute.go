@@ -63,12 +63,13 @@ type csdComputeResponse struct {
 
 // csdComputeTiming is the device-side cost breakdown of one CSD compute call.
 type csdComputeTiming struct {
-	Direct   bool
-	ReadMs   int64
-	KernelMs int64
-	Path     string
-	Snapshot string
-	Stale    bool
+	Direct      bool
+	ReadMs      int64
+	KernelMs    int64
+	Path        string
+	Snapshot    string
+	Stale       bool
+	DataVersion string
 }
 
 // Response headers used to carry device-side timings back through the volume
@@ -152,6 +153,7 @@ func (vs *VolumeServer) tryHandleCSDCompute(
 		if want, parseErr := strconv.ParseInt(expected, 10, 64); parseErr == nil && want != region.DataSize {
 			glog.Warningf("CSD compute %q volume %d needle %d: %s: filer expects %d bytes, needle has %d",
 				operation, volumeId, n.Id, staleRangeErrorCode, want, region.DataSize)
+			w.Header().Set(csdHeaderErrorClass, string(classStaleRange))
 			writeJsonError(w, r, http.StatusConflict, fmt.Errorf(
 				"%s: chunk size changed (filer expects %d bytes, needle %d now holds %d)",
 				staleRangeErrorCode, want, n.Id, region.DataSize))
@@ -166,6 +168,7 @@ func (vs *VolumeServer) tryHandleCSDCompute(
 			// configured compute script cannot silently compute over changed data.
 			glog.Warningf("CSD compute %q volume %d needle %d rejected: %v", operation, volumeId, n.Id, err)
 			w.Header().Set(csdHeaderStaleRange, "true")
+			w.Header().Set(csdHeaderErrorClass, string(classStaleRange))
 			writeJsonError(w, r, http.StatusConflict, err)
 			return true
 		}
@@ -185,6 +188,9 @@ func (vs *VolumeServer) tryHandleCSDCompute(
 		w.Header().Set(consistencyHeaderSnapshot, timing.Snapshot)
 	}
 	w.Header().Set(csdHeaderStaleRange, strconv.FormatBool(timing.Stale))
+	// M2/T2.2: report the data version actually served, so the filer can confirm
+	// that every replica answered for the needle it planned to read.
+	w.Header().Set(csdHeaderDataVersion, dataVersionOf(uint64(n.Id), uint32(n.Cookie), region.DataSize, region.LastModified))
 	if _, err := w.Write(result); err != nil {
 		glog.V(2).Infof("CSD compute response write error: %v", err)
 	}

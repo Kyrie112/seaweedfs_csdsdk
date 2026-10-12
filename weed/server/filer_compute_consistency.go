@@ -6,6 +6,7 @@ import (
 	"hash/fnv"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
@@ -46,10 +47,113 @@ const (
 	consistencyHeaderSnapshot = "X-Compute-Snapshot"
 	consistencyHeaderStale    = "X-Compute-Stale-Chunks"
 	consistencyHeaderRetry    = "X-Compute-Retry-Reason"
+	consistencyHeaderError    = "X-Compute-Error-Class"
+	consistencyHeaderDataVer  = "X-Compute-Data-Version"
 
 	// 设备侧判定区间失效的响应头(由 volume 从 agent 透传)。
 	csdHeaderStaleRange = "X-CSD-Stale-Range"
+	// csdHeaderDataVersion 是副本回报的"我实际服务了哪个数据版本"。
+	csdHeaderDataVersion = "X-CSD-Data-Version"
+	// csdHeaderErrorClass 让错误分类跨进程传递,避免靠字符串匹配。
+	csdHeaderErrorClass = "X-CSD-Error-Class"
+
+	// computeQueryParamOnStale 控制 stale_range 的处理方式:
+	// retry(默认,重新解析清单后重试一次)或 fail(直接失败)。
+	computeQueryParamOnStale = "on_stale"
 )
+
+// hostPreference 记录"本次请求已经用过哪些副本主机"。
+//
+// 作用:同一次计算请求的多个数据块尽量落在同一组副本上,减少因副本复制进度
+// 不同而反复失败重试(M2/T2.1)。它是软偏好——只有当该主机的负载仍在
+// "最小负载 + 一个数据块"的余量内时才优先,避免把负载均衡彻底压垮。
+type hostPreference struct {
+	mu    sync.Mutex
+	hosts map[string]struct{}
+}
+
+func newHostPreference() *hostPreference {
+	return &hostPreference{hosts: make(map[string]struct{})}
+}
+
+func (p *hostPreference) has(host string) bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, ok := p.hosts[host]
+	return ok
+}
+
+func (p *hostPreference) remember(host string) {
+	if p == nil || host == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.hosts[host] = struct{}{}
+}
+
+func (p *hostPreference) size() int {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.hosts)
+}
+
+// computeErrorClass 是 M2 的错误分类:调用方与运维据此区分
+// "数据变了""节点坏了""对象不存在""格式不支持"。
+type computeErrorClass string
+
+const (
+	classNone        computeErrorClass = ""
+	classNotFound    computeErrorClass = "not_found"
+	classStaleRange  computeErrorClass = "stale_range"
+	classNodeError   computeErrorClass = "node_error"
+	classUnsupported computeErrorClass = "unsupported_format"
+)
+
+// retryOnAnotherReplica 表示"换一个副本可能就好了"(节点故障、副本滞后)。
+// stale_range 不属于此类:数据本身已改变,换副本通常没用,应由请求级
+// 重新解析清单来处理(M2/T2.3)。
+func (c computeErrorClass) retryOnAnotherReplica() bool {
+	return c == classNodeError || c == classNotFound
+}
+
+// classifyComputeError 把错误归类。优先使用显式携带的分类(若上游通过
+// 响应头或错误包装给出),否则按其文本中的关键字归类。
+func classifyComputeError(err error) computeErrorClass {
+	if err == nil {
+		return classNone
+	}
+	if errors.Is(err, errStaleRange) {
+		return classStaleRange
+	}
+	text := err.Error()
+	switch {
+	case strings.Contains(text, "not found"), strings.Contains(text, "status 404"),
+		strings.Contains(text, "404 "):
+		return classNotFound
+	case strings.Contains(text, "unsupported"), strings.Contains(text, "compressed"),
+		strings.Contains(text, "manifest"):
+		return classUnsupported
+	default:
+		return classNodeError
+	}
+}
+
+// dataVersionOf 生成副本侧的版本描述串。
+//
+// 说明:SeaweedFS 的覆盖写会产生**新的 needle id**,因此"副本滞后"在本系统中
+// 主要表现为"该副本上没有这个 needle"(not_found),而不是"同一个 needle 的旧内容"。
+// 该串用于确认"副本实际服务的就是 filer 计划的那一个 needle",并结合
+// 修改时间给出可比较的版本信号;M3 引入卷数据文件代次后会加入代次号。
+func dataVersionOf(needleId uint64, cookie uint32, dataSize int64, lastModified int64) string {
+	return fmt.Sprintf("%d:%d:%d:%d", needleId, cookie, dataSize, lastModified)
+}
 
 // 设备侧返回的错误标识,volume 用它来区分"节点故障"与"数据已变"。
 const staleRangeErrorCode = "stale_range"

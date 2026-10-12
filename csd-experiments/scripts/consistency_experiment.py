@@ -48,10 +48,10 @@ def agent_post(url):
         return json.loads(response.read())
 
 
-def search(filer, upload_path, query_encoded, k):
+def search(filer, upload_path, query_encoded, k, extra=""):
     """Return (status, body_text, headers, latency_ms)."""
     url = (f"{filer}{upload_path}?compute=img_topk&k={k}"
-           f"&rec={lib.RECORD_SIZE}&q={urllib.parse.quote(query_encoded)}")
+           f"&rec={lib.RECORD_SIZE}&q={urllib.parse.quote(query_encoded)}{extra}")
     started = time.perf_counter()
     try:
         with urllib.request.urlopen(url, timeout=120) as response:
@@ -191,23 +191,49 @@ def main():
     # succeeded, and the bytes change while the device is reading them. The
     # fault is armed for exactly one request through the agent's test-only
     # /v1/fault endpoint, so the baseline phases stay clean.
+    # ---- phase B2: reuse inside the read window ----
+    #
+    # The fault is armed for exactly one request. What happens next depends on
+    # the consistency policy:
+    #   default (on_stale=retry): the filer re-reads the file entry and retries,
+    #     so the request should end up SUCCEEDING with a correct answer;
+    #   on_stale=fail: the request must fail explicitly with 409.
     armed = agent_post(args.agent + "/v1/fault?mode=mutate-on-read&count=1")
-    print(f"[B2] armed fault injection: {armed}")
+    print(f"[B2] armed one-shot fault injection: {armed}")
     status, body, headers, latency = search(args.filer, upload_path, query_encoded, args.k)
     hits = lib.parse_hits(body) if status == 200 else []
     mid_read_silent = (status == 200 and hits != truth)
+    retry_reason = headers.get("X-Compute-Retry-Reason", "")
     rows.append({
-        "phase": "B2-mid-read-reuse", "rep": 1, "http": status,
+        "phase": "B2-mid-read-reuse-retry", "rep": 1, "http": status,
         "latency_ms": f"{latency:.2f}",
         "consistency_level": headers.get("X-Compute-Consistency-Level", ""),
         "snapshot": headers.get("X-Compute-Snapshot", ""),
         "stale_chunks": headers.get("X-Compute-Stale-Chunks", ""),
         "matches_reference": int(hits == truth),
+        "retry_reason": retry_reason,
         "body": body[:200],
     })
-    print(f"[B2] http={status} {latency:7.2f} ms  body={body[:160]}")
-    print(f"[B2] silent_error={mid_read_silent}  "
-          f"(200 with a wrong answer = the failure mode M1 removes)")
+    print(f"[B2-retry] http={status} {latency:7.2f} ms retry_reason={retry_reason!r} "
+          f"matches_reference={hits == truth}")
+
+    # same fault, but the caller asked not to retry
+    assert agent_post(args.agent + "/v1/fault?mode=mutate-on-read&count=1")
+    status_fail, body_fail, headers_fail, latency_fail = search(
+        args.filer, upload_path, query_encoded, args.k, extra="&on_stale=fail")
+    hits_fail = lib.parse_hits(body_fail) if status_fail == 200 else []
+    rows.append({
+        "phase": "B2-mid-read-reuse-on_stale-fail", "rep": 1, "http": status_fail,
+        "latency_ms": f"{latency_fail:.2f}",
+        "consistency_level": headers_fail.get("X-Compute-Consistency-Level", ""),
+        "snapshot": headers_fail.get("X-Compute-Snapshot", ""),
+        "stale_chunks": headers_fail.get("X-Compute-Stale-Chunks", ""),
+        "matches_reference": int(hits_fail == truth),
+        "retry_reason": headers_fail.get("X-Compute-Retry-Reason", ""),
+        "body": body_fail[:200],
+    })
+    print(f"[B2-fail] http={status_fail} {latency_fail:7.2f} ms "
+          f"error_class={headers_fail.get('X-Compute-Error-Class','?')!r} body={body_fail[:120]}")
 
     stats_after = agent_get(args.agent + "/v1/stats")
     print()
@@ -217,6 +243,10 @@ def main():
           f"stale_ranges on agent = {stats_after.get('stale_ranges')}, "
           f"header_checks = {stats_after.get('header_checks')}")
     print(f"[sum] B1 (reuse before lookup): http={disk_reuse_status}")
+    print(f"[sum] B2-retry: http={rows[-2]['http']} retry_reason={rows[-2]['retry_reason']!r} "
+          f"matches_reference={rows[-2]['matches_reference']}")
+    print(f"[sum] B2-fail(on_stale=fail): http={rows[-1]['http']} "
+          f"error_class={headers_fail.get('X-Compute-Error-Class','?')}")
     verdict = "SILENT ERROR" if mid_read_silent else "explicit failure / correct answer"
     print(f"[sum] B2 (reuse during the read window): {verdict}")
     print(f"[sum] self_check={self_check} -> M1 verdict: "

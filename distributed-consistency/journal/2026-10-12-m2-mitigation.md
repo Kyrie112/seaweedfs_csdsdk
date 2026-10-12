@@ -1,0 +1,152 @@
+# 开发日志 2026-10-12:M2 可规避(副本一致性 + 失败语义)
+
+> 里程碑:[M2 可规避](../M2-mitigation.md) · 状态:**✅ 完成**(T2.1–T2.6)
+> 前置:[M1 可检测](2026-10-12-m1-detection.md)(已完成)
+
+## 0. 结论摘要
+
+M1 只做到"发现问题就失败";M2 把**可以自愈的失败变成成功**:
+
+| 场景 | M1 行为 | M2 行为 |
+| --- | --- | --- |
+| 读取窗口内区间被复用(数据真的变了) | 409 失败 | **200 成功**——自动重新解析清单并重试(`X-Compute-Retry-Reason: stale_range`) |
+| 调用方要求不重试(`on_stale=fail`) | — | **409**,并带 `X-Compute-Error-Class: stale_range` |
+| 副本上没有该 chunk(副本滞后) | 泛化为 500 | **404 + 分类为 `not_found`**,自动换副本重试 |
+| 节点故障 | 换副本重试 | 同上,且错误可分类观测 |
+
+| 指标 | 结果 |
+| --- | --- |
+| 重试后结果正确性 | 与暴力检索**逐位一致** |
+| 正常路径性能 | 41.54 ms 中位数(与 M1 的 42.83/48.74 ms 差异在噪声内) |
+| 重试路径代价 | 20.34 ms vs 单次 11.40 ms(≈1.8×,即两次尝试) |
+| 回归 | 服务端全部用例、存储层、设备侧 **498** 项检查全部通过 |
+
+## 1. 本次实施范围
+
+按 [M2-mitigation.md](../M2-mitigation.md) 执行 T2.1–T2.6。
+
+## 2. 开发过程
+
+### T2.4 错误分类与响应表达 ✅
+
+- 新增 `computeErrorClass` 四类:`not_found` / `stale_range` / `node_error` / `unsupported_format`,
+  以及 `classifyComputeError()`;
+- 分类**不靠字符串猜测**即可跨进程传递:volume 在响应头 `X-CSD-Error-Class` 中显式给出,
+  filer 优先采信该头,缺失时才回退到文本匹配;
+- 对外暴露 `X-Compute-Error-Class`;HTTP 状态码随之细化:
+  stale → **409**、not_found → **404**、unsupported → 400、其余 → 500
+  (B1 场景的状态码因此从 500 改善为 404)。
+
+### T2.3 `stale_range` 重试策略 ✅
+
+- 重试放在**请求级**(`proxyComputeToVolumeServer`),因为只有它同时掌握
+  "文件条目"与"整份块清单";
+- 流程:某块报 `stale_range` → **重新读取 filer 条目**(`fs.filer.FindEntry`)→
+  重新展开并校验块清单 → 生成**新的快照令牌** → 重试一次;
+- 重试上限 `computeSnapshotAttempts = 2`(首次 + 重试一次),避免活锁;
+- 与副本级重试**分层**:`node_error` / `not_found` 在块级换副本重试
+  (`retryOnAnotherReplica()`),`stale_range` 不在块级重试(换副本无用),直接上抛给请求级。
+
+### T2.1 请求级副本亲和 ✅
+
+- 新增 `hostPreference`:记录本次请求已经成功使用过的副本主机;
+- 排序规则在 CSD 能力之后插入"亲和"这一档,但带**余量保护**:
+  只有当该主机的在途负载仍在"最小负载 + 一个数据块"之内时才优先,
+  避免把负载均衡彻底压垮;
+- 每个块成功后 `preferred.remember(host)`,后续块据此收敛到同一组副本。
+
+### T2.2 副本版本回传与校验 ✅(实现口径的调整,已记录)
+
+**原计划的假设需要修正**:SeaweedFS 的覆盖写会产生**新的 needle id**,
+所以"副本滞后"在本系统中主要表现为"**该副本上没有这个 needle**"(not_found),
+而不是"同一个 needle 上的旧内容"。据此把 T2.2 落地为两件可验证的事:
+
+1. **副本回报它实际服务的版本**:volume 通过 `X-CSD-Data-Version` 回传
+   `needleId:cookie:dataSize:lastModified`(`NeedleComputeRegion` 新增
+   `LastModified` 字段,取自已解析的 needle meta);
+2. **副本滞后按 not_found 处理**:归类为可换副本重试的错误。
+
+这样 M2 覆盖了"副本内容与 filer 计划不一致"的两条实际路径:身份不符(由 M1 的设备侧
+自校验与 volume 前置校验拦住)与副本缺失(由分类 + 重试处理)。
+
+### T2.5 一致性等级 API ✅
+
+- `consistency=L0|L1|L2`(M1 已有)+ **`on_stale=retry|fail`**(本阶段新增,默认 retry);
+- 响应头回传实际达成的一致性等级、快照摘要、重试原因与错误分类。
+
+### T2.6 单元测试与端到端 ✅
+
+- 新增 4 个单元测试:错误分类、重试策略、副本亲和收敛、`on_stale` 参数契约;
+- 既有调度器测试适配新签名(亲和参数);
+- 端到端见第 3 节。
+
+## 3. 验证实验
+
+脚本:`csd-experiments/scripts/consistency_experiment.py`(512 张图 / 2 MiB / 单分块),
+原始数据:`csd-experiments/results/m2_consistency.csv`。
+
+| 阶段 | 内容 | 结果 |
+| --- | --- | --- |
+| A 正常 ×5 | 连续检索 | 200,全部与暴力检索一致(中位 11.40 ms) |
+| B1 查找前复用 | 改写 needle 头 + 数据区 | **404**(volume 元数据查找先失败) |
+| B2-retry | 按次注入"读取窗口内复用",默认策略 | **200,`retry_reason=stale_range`,结果与参考一致**,20.34 ms |
+| B2-fail | 同一注入 + `on_stale=fail` | **409,`error_class=stale_range`**,8.51 ms |
+| C 恢复 | 还原字节后检索 | 200,结果恢复正确 |
+
+**关键证据**:B2-retry 的响应头同时出现
+
+```text
+http=200  retry_reason='stale_range'  matches_reference=True
+```
+
+说明"检测到不一致 → 重新解析清单 → 重试 → 得到正确结果"这条链路是通的,
+并且**调用方可以知道这次结果经过了一次重试**(可观测性,而非静默自愈)。
+
+## 4. 性能记录
+
+| 指标 | 数值 | 说明 |
+| --- | --- | --- |
+| M2 正常路径(4096 图 / 4 分块 / 7 次中位) | **41.54 ms** | 与 M1 的 42.83 / 48.74 ms 差异在噪声内 |
+| 重试路径(B2-retry) | 20.34 ms | ≈1.8× 单次(11.40 ms),即"两次尝试"的预期代价 |
+| 立即失败(B2-fail) | 8.51 ms | 不重试,快速失败 |
+| 回传数据量 | 49 字节 | 与改造前一致 |
+
+**结论**:M2 在**正常路径上不引入可测开销**(只是多了几个响应头与一次内存内的
+偏好记录),代价只发生在真正需要重试的时候(≈1.8× 单次时延)。
+
+**未能测量的部分(如实记录)**:请求级副本亲和的端到端效果**无法在本地单副本部署中测量**
+——单 volume server 下每个 chunk 只有一个副本,不存在"可选副本"。
+本阶段只以单元测试验证其收敛性与余量保护(负载超出余量时亲和让位);
+真实效果需在 **M4 的多副本部署**中测量(参见遗留问题 R6)。
+
+## 5. 交付物
+
+| 交付物 | 位置 |
+| --- | --- |
+| 错误分类、亲和、版本串 | `weed/server/filer_compute_consistency.go` |
+| 排序中的亲和档位 | `weed/server/filer_csd_scheduler.go`、`filer_csd_scheduler_rank.go` |
+| 请求级重试 / `on_stale` / 状态码映射 | `weed/server/filer_server_handlers_proxy.go` |
+| 副本版本与错误分类头 | `weed/server/csd_compute.go` |
+| `LastModified` 采集 | `weed/storage/volume_read.go` |
+| 单元测试 | `weed/server/filer_compute_retry_test.go`(新增)、既有调度器测试适配 |
+| 实验脚本与数据 | `csd-experiments/scripts/consistency_experiment.py`、`results/m2_consistency.csv`、`results/m2_perf_normal.csv` |
+
+## 6. 遗留问题
+
+| 编号 | 事项 | 归属 |
+| --- | --- | --- |
+| R6 | 副本亲和的端到端效果需多副本部署验证(本地单副本无法测量) | M4 |
+| R7 | `unsupported_format` 目前只在文本匹配层识别,压缩数据的就地计算仍未实现 | M3/M4 |
+| R8 | 重试会放大负载(Q4):当前上限为 1 次,与扇出 8 / 每主机 16 的联动尚未压测 | M4 |
+| R9 | `stale_range` 重试仍要求"重试时数据已稳定";若持续变更最终仍会失败 | M3(版本保留可根治) |
+
+## 7. 过程记录
+
+| 顺序 | 事件 | 处理 |
+| --- | --- | --- |
+| 1 | 先做 T2.4(错误分类),因为重试策略依赖它 | 分类 + 跨进程头 |
+| 2 | 把重试放在请求级而非块级 | 只有请求级能重新解析清单 |
+| 3 | 亲和加入"一个数据块的余量"保护 | 避免破坏负载均衡 |
+| 4 | T2.2 实现口径按 SeaweedFS 语义修正 | 副本滞后表现为 not_found 而非旧内容 |
+| 5 | 适配既有测试签名 + 新增 4 个单测 | 全部通过 |
+| 6 | 端到端验证重试与失败两条路径 | 200/409 均符合预期 |

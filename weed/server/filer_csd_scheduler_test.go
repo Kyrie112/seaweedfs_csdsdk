@@ -96,11 +96,11 @@ func TestRankAndReserveIncrementsInflight(t *testing.T) {
 		csdInflightBytes: make(map[string]int64),
 		csdInflightReqs:  make(map[string]int64),
 	}
-	first, releaseFirst, err := fs.rankAndReserve(context.Background(), []string{one.URL, two.URL}, 4096, nil)
+	first, releaseFirst, err := fs.rankAndReserve(context.Background(), []string{one.URL, two.URL}, 4096, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, _, err := fs.rankAndReserve(context.Background(), []string{one.URL, two.URL}, 4096, nil)
+	second, _, err := fs.rankAndReserve(context.Background(), []string{one.URL, two.URL}, 4096, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func TestRankAndReserveIncrementsInflight(t *testing.T) {
 		t.Fatalf("rankAndReserve selected the same replica twice: %s", first)
 	}
 	releaseFirst()
-	third, _, err := fs.rankAndReserve(context.Background(), []string{one.URL, two.URL}, 4096, nil)
+	third, _, err := fs.rankAndReserve(context.Background(), []string{one.URL, two.URL}, 4096, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

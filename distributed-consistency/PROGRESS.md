@@ -7,7 +7,7 @@
 | 里程碑 | 目标 | 步骤数 | 已完成 | 状态 | 出口条件 |
 | --- | --- | --- | --- | --- | --- |
 | [M1 可检测](M1-detection.md) | 把静默错误变为显式失败 | 8 | 8 | ✅ 已完成 | 注入"读取期间替换 needle"时不再返回数值(实测 409);时延回归 < 5%(低于噪声) |
-| [M2 可规避](M2-mitigation.md) | 副本一致性 + 失败语义 | 6 | 0 | ⬜ 未开始 | 副本滞后时 L2 不返回混版结果;错误可分类观测 |
+| [M2 可规避](M2-mitigation.md) | 副本一致性 + 失败语义 | 6 | 6 | ✅ 已完成 | 实测:stale 自动重试后成功(200 + retry_reason);`on_stale=fail` 返回 409;错误可分类 |
 | [M3 版本化快照](M3-versioning.md) | 版本保留 + 引用回收:老任务读老版本,引用归零后 GC | 8 | 0 | ⬜ 未开始 | 整理与计算并发时在途请求**全部成功**;版本可回收;崩溃安全 |
 | [M4 可验证](M4-verification.md) | 故障注入矩阵 + 不变量检查 | 5 | 0 | ⬜ 未开始 | F1–F7 每行有结论;静默错误数为 0 |
 
@@ -28,14 +28,14 @@
 
 ### M2 可规避
 
-| ID | 步骤 | 改动位置 | 依赖 | 状态 | 完成判据 |
-| --- | --- | --- | --- | --- | --- |
-| T2.1 | 请求级副本亲和 | `filer_csd_scheduler.go`、`filer_csd_scheduler_rank.go` | M1 完成 | ⬜ | 同一请求副本集合收敛度可测 |
-| T2.2 | 副本版本回传与校验 | `filer_compute_aggregation.go` | T2.1 | ⬜ | L2 下混版请求被拒绝或重试 |
-| T2.3 | `stale_range` 重试策略 | `filer_server_handlers_proxy.go` | T1.4 | ⬜ | 重新解析清单并重试一次,不活锁 |
-| T2.4 | 错误分类与响应表达 | `csd_compute.go`、`filer_server_handlers_proxy.go` | T2.3 | ⬜ | 四类错误码可从响应头区分 |
-| T2.5 | 一致性等级 API | `filer_compute_api.go`、`filer_server_handlers_read.go` | T2.2 | ⬜ | `consistency=` / `on_stale=` 生效且有文档 |
-| T2.6 | 一致性单元测试 | `weed/server/*_test.go` | T2.1–T2.5 | ⬜ | 构造滞后副本可稳定复现并检出 |
+| ID | 步骤 | 改动位置 | 依赖 | 状态 | 完成判据 | 证据 |
+| --- | --- | --- | --- | --- | --- | --- |
+| T2.1 | 请求级副本亲和 | `filer_csd_scheduler.go`、`filer_csd_scheduler_rank.go` | M1 完成 | ✅ | 同一请求副本集合收敛度可测 | `hostPreference` + 一档余量保护;单测验证收敛与让位 |
+| T2.2 | 副本版本回传与校验 | `filer_compute_aggregation.go` | T2.1 | ✅ | L2 下混版请求被拒绝或重试 | `X-CSD-Data-Version` 回传 + 副本滞后按 not_found 处理(口径修正见日志) |
+| T2.3 | `stale_range` 重试策略 | `filer_server_handlers_proxy.go` | T1.4 | ✅ | 重新解析清单并重试一次,不活锁 | 请求级重解析 + 重试一次;实测 200 + `retry_reason=stale_range` |
+| T2.4 | 错误分类与响应表达 | `csd_compute.go`、`filer_server_handlers_proxy.go` | T2.3 | ✅ | 四类错误码可从响应头区分 | 四类错误 + `X-Compute-Error-Class`;B1 状态码由 500 改善为 404 |
+| T2.5 | 一致性等级 API | `filer_compute_api.go`、`filer_server_handlers_read.go` | T2.2 | ✅ | `consistency=` / `on_stale=` 生效且有文档 | `on_stale=retry|fail` 实测 200 / 409 |
+| T2.6 | 一致性单元测试 | `weed/server/*_test.go` | T2.1–T2.5 | ✅ | 构造滞后副本可稳定复现并检出 | 新增 4 单测;端到端 B2 两路径通过 |
 
 ### M3 版本化快照与延迟回收(核心机制)
 
@@ -70,8 +70,8 @@
 | Q1 | filer store 是否提供单调 revision(否则用 mtime) | T1.1 | ✅ 已决策:用 `Mtime.UnixNano()` |
 | Q2 | 设备侧校验头部是否需要额外 fd | T1.5 | ✅ 已决策:复用 buffered fd |
 | Q3 | `params` 保留键名约定 | T1.1、T1.4 | ✅ 已决策:`snap`/`chunk`/`csize`/`ncookie`/`nid` |
-| Q4 | L2 重试是否会放大负载(与扇出/每主机上限联动) | T2.3 | ⬜ 待确认 |
-| Q5 | 降级到脚本路径时是否重新校验版本 | T2.4 | ⬜ 待确认 |
+| Q4 | L2 重试是否会放大负载 | T2.3 | ✅ 已决策:重试上限 1 次;压测留待 M4(R8) |
+| Q5 | 降级到脚本路径时是否重新校验版本 | T2.4 | ✅ 已决策:stale 一律显式失败,不降级 |
 | Q6 | 版本文件命名与独立 `.idx` 目录配置的兼容性 | T3.2 | ⬜ 待确认 |
 | Q7 | Filer 引用表是否需要持久化;重启窗口如何界定 | T3.5 | ⬜ 待确认 |
 | Q8 | 宽限期 / 版本数上限 / 空间上限的默认取值 | T3.6、T3.8 | ⬜ 待确认 |
@@ -80,11 +80,12 @@
 
 ## 里程碑决策门
 
-> M1 决策门 D1 已于 2026-10-12 通过,详见
-> [journal/2026-10-12-m1-detection.md](journal/2026-10-12-m1-detection.md)。
+> M1 决策门 D1 与 M2 决策门 D2 已于 2026-10-12 通过,详见
+> [journal/2026-10-12-m1-detection.md](journal/2026-10-12-m1-detection.md) 与
+> [journal/2026-10-12-m2-mitigation.md](journal/2026-10-12-m2-mitigation.md)。
 
 | 决策门 | 位置 | 判据 |
 | --- | --- | --- |
 | D1 | M1 结束 | ✅ **通过**(2026-10-12):自校验开销低于噪声下限(理论 0.004%),进入 M2 |
-| D2 | M2 结束 | 若请求级亲和已能覆盖混版风险,M3 可标记为 ➖ 不适用 |
+| D2 | M2 结束 | ✅ **通过**(2026-10-12):分类 + 重试已闭环;M3 仍是核心机制(见 R9、[决策日志](journal/2026-10-12-m3-versioning-design.md)) |
 | D3 | M3 结束 | 空间放大可接受 → 默认启用版本保留;否则缩短宽限期或改为按需开启(回答 Q8/Q10) |

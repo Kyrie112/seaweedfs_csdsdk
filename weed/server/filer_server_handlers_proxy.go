@@ -2,7 +2,6 @@ package weed_server
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -176,30 +175,77 @@ func validateChunksCoverFile(chunks []*filer_pb.FileChunk, fileSize int64) error
 
 func (fs *FilerServer) proxyComputeToVolumeServer(w http.ResponseWriter, r *http.Request, entry *filer.Entry, operation string) {
 	ctx := r.Context()
-	dataChunks, err := resolveComputeChunks(ctx, fs, entry)
-	if err != nil {
-		writeJsonError(w, r, http.StatusBadRequest, err)
-		return
-	}
-	// T1.2: one snapshot token per request. It is generated from the chunk list
-	// that was just validated, so every chunk shares the same version view.
-	snapshot := newComputeSnapshot(string(entry.FullPath), entry, dataChunks)
 	level := consistencyLevelFromQuery(r.URL.Query().Get("consistency"))
-	w.Header().Set(consistencyHeaderSnapshot, snapshot.digest)
-	w.Header().Set(consistencyHeaderLevel, level)
-	glog.V(1).InfofCtx(ctx, "compute %q snapshot %s level %s", operation, snapshot.String(), level)
+	attempts := computeSnapshotAttempts
+	if strings.EqualFold(r.URL.Query().Get(computeQueryParamOnStale), "fail") {
+		attempts = 1
+	}
 
-	if len(dataChunks) == 1 && dataChunks[0].GetOffset() == 0 && dataChunks[0].GetSize() == entry.FileSize {
-		// Original single-chunk fast path: whole file lives in one needle.
-		fs.proxySingleChunkCompute(w, r, entry, dataChunks[0], snapshot, 0, operation)
-		return
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		if attempt > 0 {
+			// T2.3: a chunk reported stale_range, which means the data changed
+			// after this request planned its version. Re-read the file entry so
+			// the next attempt works on a fresh chunk list and snapshot token.
+			refreshed, refreshErr := fs.filer.FindEntry(ctx, entry.FullPath)
+			if refreshErr != nil || refreshed == nil {
+				glog.WarningfCtx(ctx, "compute %q: cannot refresh entry after stale_range: %v", operation, refreshErr)
+				break
+			}
+			glog.V(1).InfofCtx(ctx, "compute %q: retrying with a refreshed chunk list after stale_range", operation)
+			entry = refreshed
+			w.Header().Set(consistencyHeaderRetry, string(classStaleRange))
+		}
+
+		dataChunks, err := resolveComputeChunks(ctx, fs, entry)
+		if err != nil {
+			writeJsonError(w, r, http.StatusBadRequest, err)
+			return
+		}
+		// T1.2: one snapshot token per request, generated from the chunk list that
+		// was just validated, so every chunk shares the same version view.
+		snapshot := newComputeSnapshot(string(entry.FullPath), entry, dataChunks)
+		w.Header().Set(consistencyHeaderSnapshot, snapshot.digest)
+		w.Header().Set(consistencyHeaderLevel, level)
+		preferred := newHostPreference()
+
+		var attemptErr error
+		if len(dataChunks) == 1 && dataChunks[0].GetOffset() == 0 && dataChunks[0].GetSize() == entry.FileSize {
+			// Original single-chunk fast path: whole file lives in one needle.
+			attemptErr = fs.proxySingleChunkCompute(w, r, entry, dataChunks[0], snapshot, 0, operation, preferred)
+		} else {
+			if err := validateChunksCoverFile(dataChunks, int64(entry.FileSize)); err != nil {
+				writeJsonError(w, r, http.StatusBadRequest, err)
+				return
+			}
+			glog.V(0).InfofCtx(ctx, "compute %q across %d chunks of %s", operation, len(dataChunks), entry.Name())
+			attemptErr = fs.proxyMultiChunkCompute(w, r, entry, dataChunks, snapshot, operation, preferred)
+		}
+		if attemptErr == nil {
+			return // the response has already been written
+		}
+
+		// Only a stale range is worth re-planning; node failures were already
+		// retried on other replicas inside the chunk dispatch.
+		lastErr = attemptErr
+		if classifyComputeError(attemptErr) != classStaleRange {
+			break
+		}
 	}
-	if err := validateChunksCoverFile(dataChunks, int64(entry.FileSize)); err != nil {
-		writeJsonError(w, r, http.StatusBadRequest, err)
-		return
+
+	class := classifyComputeError(lastErr)
+	w.Header().Set(consistencyHeaderError, string(class))
+	status := http.StatusInternalServerError
+	switch class {
+	case classStaleRange:
+		status = http.StatusConflict
+	case classNotFound:
+		status = http.StatusNotFound
+	case classUnsupported:
+		status = http.StatusBadRequest
 	}
-	glog.V(0).InfofCtx(ctx, "compute %q across %d chunks of %s", operation, len(dataChunks), entry.Name())
-	fs.proxyMultiChunkCompute(w, r, entry, dataChunks, snapshot, operation)
+	glog.WarningfCtx(ctx, "compute %q failed (%s): %v", operation, class, lastErr)
+	writeJsonError(w, r, status, lastErr)
 }
 
 // chunkComputeTiming captures the filer-side and device-side cost of one chunk
@@ -217,7 +263,13 @@ type chunkComputeTiming struct {
 	// means the peer did not implement the token (an older agent).
 	Snapshot   string
 	ChunkIndex int
+	// DataVersion is the version the replica reported for the needle it served.
+	DataVersion string
 }
+
+// computeSnapshotAttempts bounds the request-level retry loop (M2/T2.3):
+// the first attempt plus one retry after re-reading the file entry.
+const computeSnapshotAttempts = 2
 
 // computeTimingSummary aggregates per-chunk timings for logging and for the
 // response headers consumed by the benchmark scripts.
@@ -278,18 +330,13 @@ func parseHeaderInt64(value string) int64 {
 
 // proxySingleChunkCompute keeps the original behavior: proxy the compute
 // request to the single volume server holding the whole file.
-func (fs *FilerServer) proxySingleChunkCompute(w http.ResponseWriter, r *http.Request, entry *filer.Entry, chunk *filer_pb.FileChunk, snapshot computeSnapshot, chunkIndex int, operation string) {
+func (fs *FilerServer) proxySingleChunkCompute(w http.ResponseWriter, r *http.Request, entry *filer.Entry, chunk *filer_pb.FileChunk, snapshot computeSnapshot, chunkIndex int, operation string, preferred *hostPreference) error {
 	ctx := r.Context()
 	fileId := chunk.GetFileIdString()
-	body, timing, err := fs.fetchChunkComputeResult(ctx, r, fileId, entry.Name(), operation, int64(chunk.GetSize()), chunk.GetOffset(), snapshot, chunkIndex)
+	body, timing, err := fs.fetchChunkComputeResult(ctx, r, fileId, entry.Name(), operation, int64(chunk.GetSize()), chunk.GetOffset(), snapshot, chunkIndex, preferred)
 	if err != nil {
-		status := http.StatusInternalServerError
-		if errors.Is(err, errStaleRange) {
-			status = http.StatusConflict
-		}
 		glog.ErrorfCtx(ctx, "compute proxy to volume: %v", err)
-		writeJsonError(w, r, status, err)
-		return
+		return err
 	}
 	setComputeTimingHeaders(w, []chunkComputeTiming{timing})
 	glog.V(1).InfofCtx(ctx, "compute %q single chunk %s: dispatch_ms=%d direct=%t device_read_ms=%d kernel_ms=%d",
@@ -300,6 +347,7 @@ func (fs *FilerServer) proxySingleChunkCompute(w http.ResponseWriter, r *http.Re
 	if _, err := w.Write(body); err != nil {
 		glog.V(2).InfofCtx(ctx, "compute response write error: %v", err)
 	}
+	return nil
 }
 
 // fetchChunkComputeResult issues one compute request to the volume server that
@@ -313,7 +361,7 @@ func (fs *FilerServer) proxySingleChunkCompute(w http.ResponseWriter, r *http.Re
 // guaranteed to target a different replica. Without that set, re-ranking could
 // hand the request straight back to the replica that just failed and failover
 // would be a no-op.
-func (fs *FilerServer) fetchChunkComputeResult(ctx context.Context, r *http.Request, fileId string, filename string, operation string, payloadBytes int64, baseOffset int64, snapshot computeSnapshot, chunkIndex int) (body []byte, timing chunkComputeTiming, err error) {
+func (fs *FilerServer) fetchChunkComputeResult(ctx context.Context, r *http.Request, fileId string, filename string, operation string, payloadBytes int64, baseOffset int64, snapshot computeSnapshot, chunkIndex int, preferred *hostPreference) (body []byte, timing chunkComputeTiming, err error) {
 	timing = chunkComputeTiming{FileId: fileId, PayloadBytes: payloadBytes, ChunkIndex: chunkIndex}
 	started := time.Now()
 	defer func() {
@@ -331,7 +379,7 @@ func (fs *FilerServer) fetchChunkComputeResult(ctx context.Context, r *http.Requ
 	excluded := make(map[string]struct{})
 	var lastErr error
 	for attempt := 0; attempt < len(urlStrings); attempt++ {
-		raw, release, reserveErr := fs.rankAndReserve(ctx, urlStrings, payloadBytes, excluded)
+		raw, release, reserveErr := fs.rankAndReserve(ctx, urlStrings, payloadBytes, excluded, preferred)
 		if reserveErr != nil {
 			if lastErr != nil {
 				break
@@ -346,10 +394,23 @@ func (fs *FilerServer) fetchChunkComputeResult(ctx context.Context, r *http.Requ
 			timing.KernelMs = deviceTiming.KernelMs
 			timing.Path = deviceTiming.Path
 			timing.Snapshot = deviceTiming.Snapshot
+			timing.DataVersion = deviceTiming.DataVersion
+			// Remember the host so the rest of this request can stay on the same
+			// replica set (M2/T2.1).
+			preferred.remember(csdHostOf(raw))
 			return chunkBody, timing, nil
 		}
+		// M2/T2.4: classify the failure. A node error or a replica that does not
+		// have the chunk yet is worth trying elsewhere; a stale range is not -
+		// the data itself changed, so the request level has to re-plan.
+		class := classifyComputeError(fetchErr)
 		excluded[csdHostOf(raw)] = struct{}{}
-		glog.Warningf("compute %q via %s failed, excluding it from further attempts: %v", operation, raw, fetchErr)
+		if !class.retryOnAnotherReplica() {
+			glog.Warningf("compute %q via %s failed (%s), not retrying another replica: %v",
+				operation, raw, class, fetchErr)
+			return nil, timing, fetchErr
+		}
+		glog.Warningf("compute %q via %s failed (%s), trying another replica: %v", operation, raw, class, fetchErr)
 		lastErr = fetchErr
 	}
 	if lastErr == nil {
@@ -423,12 +484,13 @@ func (fs *FilerServer) fetchFromComputeReplica(ctx context.Context, r *http.Requ
 		return nil, noTiming, fmt.Errorf("volume compute returned status %d: %s", proxyResponse.StatusCode, strings.TrimSpace(string(errBody)))
 	}
 	timing := csdComputeTiming{
-		Direct:   strings.EqualFold(proxyResponse.Header.Get(csdHeaderDirect), "true"),
-		ReadMs:   parseHeaderInt64(proxyResponse.Header.Get(csdHeaderReadMs)),
-		KernelMs: parseHeaderInt64(proxyResponse.Header.Get(csdHeaderKernelMs)),
-		Path:     proxyResponse.Header.Get(csdHeaderPath),
-		Snapshot: proxyResponse.Header.Get(consistencyHeaderSnapshot),
-		Stale:    strings.EqualFold(proxyResponse.Header.Get(csdHeaderStaleRange), "true"),
+		Direct:      strings.EqualFold(proxyResponse.Header.Get(csdHeaderDirect), "true"),
+		ReadMs:      parseHeaderInt64(proxyResponse.Header.Get(csdHeaderReadMs)),
+		KernelMs:    parseHeaderInt64(proxyResponse.Header.Get(csdHeaderKernelMs)),
+		Path:        proxyResponse.Header.Get(csdHeaderPath),
+		Snapshot:    proxyResponse.Header.Get(consistencyHeaderSnapshot),
+		Stale:       strings.EqualFold(proxyResponse.Header.Get(csdHeaderStaleRange), "true"),
+		DataVersion: proxyResponse.Header.Get(csdHeaderDataVersion),
 	}
 	body, err := io.ReadAll(io.LimitReader(proxyResponse.Body, computeChunkMaxResultBytes))
 	if err != nil {
@@ -441,7 +503,7 @@ func (fs *FilerServer) fetchFromComputeReplica(ctx context.Context, r *http.Requ
 // volume server (each chunk is computed in place on its volume), then
 // aggregates the small numeric per-chunk results at the filer and reports
 // the merged total back to the client.
-func (fs *FilerServer) proxyMultiChunkCompute(w http.ResponseWriter, r *http.Request, entry *filer.Entry, chunks []*filer_pb.FileChunk, snapshot computeSnapshot, operation string) {
+func (fs *FilerServer) proxyMultiChunkCompute(w http.ResponseWriter, r *http.Request, entry *filer.Entry, chunks []*filer_pb.FileChunk, snapshot computeSnapshot, operation string, preferred *hostPreference) error {
 	ctx := r.Context()
 	type chunkResult struct {
 		body   []byte
@@ -460,7 +522,7 @@ func (fs *FilerServer) proxyMultiChunkCompute(w http.ResponseWriter, r *http.Req
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			body, timing, err := fs.fetchChunkComputeResult(ctx, r, fid, entry.Name(), operation, payload, chunks[idx].GetOffset(), snapshot, idx)
+			body, timing, err := fs.fetchChunkComputeResult(ctx, r, fid, entry.Name(), operation, payload, chunks[idx].GetOffset(), snapshot, idx, preferred)
 			results[idx] = chunkResult{body: body, timing: timing, err: err}
 		}(i, fileId, payloadBytes)
 	}
@@ -484,10 +546,8 @@ func (fs *FilerServer) proxyMultiChunkCompute(w http.ResponseWriter, r *http.Req
 	w.Header().Set(consistencyHeaderLevel, effectiveLevel)
 	w.Header().Set(consistencyHeaderStale, strconv.Itoa(staleChunks))
 	if !ok {
-		writeJsonError(w, r, http.StatusConflict, fmt.Errorf(
-			"%s: %d of %d chunks did not confirm snapshot %s",
-			staleRangeErrorCode, staleChunks, len(chunks), snapshot.digest))
-		return
+		return fmt.Errorf("%w: %d of %d chunks did not confirm snapshot %s",
+			errStaleRange, staleChunks, len(chunks), snapshot.digest)
 	}
 	if staleChunks > 0 {
 		glog.Warningf("compute %q: %d of %d chunks did not confirm snapshot %s; result is marked %s",
@@ -506,12 +566,9 @@ func (fs *FilerServer) proxyMultiChunkCompute(w http.ResponseWriter, r *http.Req
 	bodies := make([][]byte, len(results))
 	for i := range results {
 		if results[i].err != nil {
-			status := http.StatusInternalServerError
-			if errors.Is(results[i].err, errStaleRange) {
-				status = http.StatusConflict
-			}
-			writeJsonError(w, r, status, fmt.Errorf("chunk %d compute failed: %v", i, results[i].err))
-			return
+			// Return the error to the caller: the request level decides whether to
+			// re-plan (stale) or surface it with the right status.
+			return fmt.Errorf("chunk %d compute failed: %w", i, results[i].err)
 		}
 		bodies[i] = results[i].body
 	}
@@ -523,12 +580,14 @@ func (fs *FilerServer) proxyMultiChunkCompute(w http.ResponseWriter, r *http.Req
 		aggregate, aggregateErr = aggregateAdditiveResults(bodies)
 	}
 	if aggregateErr != nil {
-		writeJsonError(w, r, http.StatusBadRequest, aggregateErr)
-		return
+		return aggregateErr
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Length", strconv.Itoa(len(aggregate)))
-	io.WriteString(w, aggregate)
+	if _, err := io.WriteString(w, aggregate); err != nil {
+		glog.V(2).Infof("compute response write error: %v", err)
+	}
+	return nil
 }
 
 func volumeComputePath(fileId string, filename string) string {
