@@ -30,6 +30,7 @@ csd-experiments/
 
 ### 规划
 
+- [reports/WORKLOAD_EXPANSION_PLAN.md](reports/WORKLOAD_EXPANSION_PLAN.md):**毕业设计工作量扩展选题清单**(P0/P1/P2、时间打包、论文映射)
 - [reports/THESIS_DRAFT.md](reports/THESIS_DRAFT.md):**毕业论文初稿**(摘要/绪论/技术基础/总体设计/关键机制/图像检索算子/实验/结论)
 - [reports/REPORT_PROJECT_OVERVIEW.md](reports/REPORT_PROJECT_OVERVIEW.md):**项目总览汇报**(面向不了解本工作的读者,含速览/背景/逐条工作/结果/讲稿)
 - [ROADMAP.md](ROADMAP.md):后续工作计划(阶段一机制修复 / 阶段二调度模型 / 阶段三算子与实验)
