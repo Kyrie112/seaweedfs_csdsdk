@@ -194,3 +194,111 @@ func TestGenerationIsRecoveredAcrossRestart(t *testing.T) {
 		t.Fatal("expected version files to be discoverable after restart")
 	}
 }
+
+// TestGCRespectsActiveLease is the core of the MVCC/epoch-style design: a
+// version pinned by a live lease must never be reclaimed, no matter how old it
+// is; once the lease is released it becomes reclaimable.
+func TestGCRespectsActiveLease(t *testing.T) {
+	volume, _ := newVersioningTestVolume(t)
+	if err := os.WriteFile(volume.FileName(".dat"), []byte("generation 0"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := volume.ensureVersionLink(); err != nil {
+		t.Fatal(err)
+	}
+	historicalGeneration := volume.CurrentDataGeneration()
+	historicalPath := volume.versionFilePath(historicalGeneration)
+	volume.bumpDataGeneration()
+
+	// A reader pins the historical generation.
+	lease := volume.AcquireVersionLease(historicalGeneration, time.Minute)
+	// retention=0 forces the "age" check to pass, so only the lease can protect
+	// the version. The clock stays real: a future timestamp would expire the very
+	// lease we are testing.
+	if removed := volume.gcExpiredVersions(time.Now(), 0, 0); len(removed) != 0 {
+		t.Fatalf("reclaimed a version pinned by an active lease: %v", removed)
+	}
+	if _, err := os.Stat(historicalPath); err != nil {
+		t.Fatalf("pinned version disappeared: %v", err)
+	}
+	if infos := volume.DataVersionInfos(); len(infos) == 0 || infos[0].Leases == 0 {
+		t.Fatalf("lease not visible in version info: %+v", infos)
+	}
+
+	// Releasing the lease makes it reclaimable.
+	volume.ReleaseVersionLease(lease)
+	removed := volume.gcExpiredVersions(time.Now(), 0, 0)
+	found := false
+	for _, path := range removed {
+		if path == historicalPath {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("released version was not reclaimed: %v", removed)
+	}
+}
+
+// TestExpiredLeaseUnpins: the TTL is the crash safety net. A lease whose holder
+// disappeared must not pin a version forever.
+func TestExpiredLeaseUnpins(t *testing.T) {
+	volume, _ := newVersioningTestVolume(t)
+	if err := os.WriteFile(volume.FileName(".dat"), []byte("generation 0"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := volume.ensureVersionLink(); err != nil {
+		t.Fatal(err)
+	}
+	generation := volume.CurrentDataGeneration()
+	volume.AcquireVersionLease(generation, 10*time.Millisecond)
+	volume.bumpDataGeneration()
+	time.Sleep(30 * time.Millisecond)
+
+	if removed := volume.gcExpiredVersions(time.Now().Add(24*time.Hour), 0, 0); len(removed) != 1 {
+		t.Fatalf("expired lease still pinned the version: removed=%v", removed)
+	}
+}
+
+// TestLeaseRenewal: a long read can extend its lease instead of losing the
+// version, which is what a heartbeat-based lease in a mature MVCC system does.
+func TestLeaseRenewal(t *testing.T) {
+	volume, _ := newVersioningTestVolume(t)
+	lease := volume.AcquireVersionLease(0, 20*time.Millisecond)
+	if !volume.RenewVersionLease(lease, time.Minute) {
+		t.Fatal("renew on a live lease failed")
+	}
+	time.Sleep(40 * time.Millisecond)
+	if pinned := volume.pinnedGenerationsLocked(time.Now()); pinned[0] == 0 {
+		t.Fatal("renewed lease expired early")
+	}
+	volume.ReleaseVersionLease(lease)
+	if !volume.RenewVersionLease(lease, time.Minute) {
+		// release makes renew fail, which is the expected contract; assert it
+		return
+	}
+	t.Fatal("renew succeeded after the lease was released")
+}
+
+// TestGenerationPersistsAcrossRestart: the generation is durable, so a restart
+// cannot hand out a generation number that an older retained file still uses.
+func TestGenerationPersistsAcrossRestart(t *testing.T) {
+	volume, dir := newVersioningTestVolume(t)
+	if err := os.WriteFile(volume.FileName(".dat"), []byte("data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	volume.bumpDataGeneration()
+	volume.bumpDataGeneration()
+	want := volume.CurrentDataGeneration()
+	if _, err := os.Stat(volume.generationFilePath()); err != nil {
+		t.Fatalf("generation file missing: %v", err)
+	}
+
+	reopened, err := NewVolume(dir, dir, "", needle.VolumeId(1), NeedleMapInMemory,
+		&super_block.ReplicaPlacement{}, &needle.TTL{}, 0, needle.GetCurrentVersion(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reopened.CurrentDataGeneration(); got != want {
+		t.Fatalf("generation after restart = %d, want %d", got, want)
+	}
+}

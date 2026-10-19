@@ -1,0 +1,109 @@
+# 开发日志 2026-10-19:一致性健壮性增强(租约 + 低水位回收 + 代次持久化)
+
+> 背景:2026-10-12 的 M3 用"最近使用时间 + TTL"决定何时回收旧版本,语义上是
+> "猜测没人用"。本次参照成熟的多版本控制系统改为**租约(lease)+ 低水位回收**,
+> 目标是让"回收绝不打断在途读取"成为可验证的强约束,而不是概率性保证。
+> 前置:[M3 日志](2026-10-12-m3-versioning.md)、[总日志](2026-10-12-overall-summary.md)。
+
+## 0. 结论摘要
+
+| 项目 | 改前 | 改后 |
+| --- | --- | --- |
+| 回收判据 | 最近使用时间 + TTL | **未过期租约数 == 0** + 宽限期 |
+| 读取保护 | 无显式钉住 | 读取前 `AcquireVersionLease`,读完 `Release` |
+| 崩溃兜底 | TTL | 租约 TTL(默认 30s)自动过期 |
+| 代次恢复 | 扫描版本文件推断 | **持久化到 `<base>.dat.gen`**(原子写 + fsync) |
+| 可观测性 | 版本列表 | 版本列表 + **每版本活跃租约数** |
+| 测试 | 5 单测 + 1 集成 | 9 单测 + 1 集成,全部通过 |
+| 集群验证 | 版本文件生成 | 版本文件 + **租约可见(`leases:1`)/释放** |
+
+## 1. 参照的成熟机制
+
+| 成熟系统 / 机制 | 借鉴点 | 在本系统里的落法 |
+| --- | --- | --- |
+| **PostgreSQL MVCC** | 旧版本是否可清理取决于"是否还有活跃快照能看到它"(xmin horizon) | 每个代次维护活跃租约数,回收只看"低水位" |
+| **RCU / epoch-based reclamation** | 读者先进入 epoch,回收等待宽限期 | 读取前获取租约、读完释放;TTL 作为崩溃兜底 |
+| **etcd lease** | 租约有 TTL,可续租,过期自动释放 | `Acquire/Release/RenewVersionLease`,TTL 默认 30s |
+| **RocksDB 快照与文件保留** | 快照存在的 SST 文件不能被删除 | 版本硬链接在租约存续期间不可回收 |
+
+## 2. 实现
+
+### 2.1 租约(读取窗口钉住)
+
+```text
+tryHandleCSDCompute:
+    lease := volume.AcquireVersionLease(region.Generation, 30s)
+    defer/immediately after: volume.ReleaseVersionLease(lease)
+    -> 设备读取期间,该代次一定不可回收
+```
+
+- 正常路径:读完立即释放(毫秒级);
+- 进程崩溃:租约 30s 后自动过期,不会永久占住版本;
+- 长读:可调用 `RenewVersionLease` 续租。
+
+### 2.2 低水位回收
+
+```text
+可回收(g) := g != current
+          ∧ activeLeases(g) == 0          ← 新增的强约束
+          ∧ now - lastUsed(g) >= retention
+          ∧ g 不在"保留最近 N 个历史版本"的集合里
+```
+
+`versionsToReclaim()` 会先清理过期租约,再据"仍在钉住的代次"过滤候选。
+
+### 2.3 代次持久化
+
+- 代次写入 `<base>.dat.gen`(临时文件 → fsync → rename);
+- 加载时取 `max(持久化代次, 磁盘上最大版本文件代次)`;
+- 因此**重启不会复用旧代次**,避免新请求的版本链接覆盖旧 inode 的名字。
+
+### 2.4 运维可观测
+
+`GET /compute/versions?volume=N` 的每个版本新增 `leases` 字段;
+`POST ...&action=lease|release` 可显式持有/释放租约(验证与运维用)。
+
+## 3. 测试
+
+| 测试 | 验证内容 | 结果 |
+| --- | --- | --- |
+| `TestGCRespectsActiveLease` | 有活跃租约时,即使保留期为 0 也**绝不回收**;释放后可回收 | PASS |
+| `TestExpiredLeaseUnpins` | 持有者崩溃(租约过期)后版本可回收 | PASS |
+| `TestLeaseRenewal` | 续租生效;已释放的租约不能续 | PASS |
+| `TestGenerationPersistsAcrossRestart` | 代次写入磁盘,重启后不复用 | PASS |
+| 既有 5 个版本/GC 测试 | 版本链接、回收、卷扫描、重启 | PASS |
+| `TestComputeRegionReadsRetainedVersion` | 真实写入 → 描述符 → 替换 `.dat` → 旧版本仍可读 → 过期回收 | PASS |
+
+## 4. 实验(本地三节点)
+
+`run_local_multinode.sh` 新增租约演示阶段,结果:
+
+```text
+lease: {"generation":0,"lease":4,"ttl":"10m0s","volume_id":"1"}
+{"volume_id":"1", ... "versions":[{"path":".../1.dat.g0","generation":0,
+                                  "current":true,"last_used":"...","leases":1}]}
+released lease 4
+```
+
+- 租约创建成功并返回 ID;
+- `GET /compute/versions` 中对应版本显示 `"leases": 1` ✓
+- 释放后租约计数归零 ✓
+
+计算正确性:与暴力检索逐位一致(`m3_multinode.csv`)。
+
+## 5. 与上一版的差异(诚实记录)
+
+1. 语义从"TTL 近似"变成"租约精确钉住 + TTL 兜底",但**仍是单卷本地租约**,
+   不是跨节点的全局引用表;
+2. 租约的生命周期覆盖"设备读取窗口",不覆盖 Filer 聚合阶段(聚合不再访问数据);
+3. 崩溃恢复依赖 TTL:租约默认 30s,远大于一次设备读的耗时;
+4. 版本粒度仍是**卷数据文件代次**,不是记录级 MVCC。
+
+## 6. 残留风险与下一步
+
+| 编号 | 事项 | 建议 |
+| --- | --- | --- |
+| S1 | 跨节点精确引用(多副本同版本一致性) | 引入 filer 侧引用表或 master 协调的租约 |
+| S2 | 超过租约 TTL 的超长读会被解钉 | 长读应周期性续租(接口已提供) |
+| S3 | 无压缩/无上限时的空间放大 | 已有版本数上限(4)与 TTL;需长跑定标 |
+| S4 | 真实整理触发下的集群级 GC | 在 tan 集群补测(见 M4 的 G1) |

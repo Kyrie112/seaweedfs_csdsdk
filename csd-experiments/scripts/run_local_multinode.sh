@@ -118,6 +118,24 @@ echo "== files on disk =="
 find "$WORK" -name '*.dat*' | sort | sed "s|$WORK/||"
 
 echo
+echo "== lease visibility (MVCC pinning) =="
+for i in $(seq 0 $((VOLUME_COUNT - 1))); do
+    volume_port=$((VOLUME_BASE + i))
+    volume_id=$(local_volume_id "$i") || continue
+    lease_json=$(curl -s -X POST \
+        "http://127.0.0.1:${volume_port}/compute/versions?volume=${volume_id}&action=lease&generation=0&ttl=60s")
+    echo "lease: ${lease_json}"
+    curl -s "http://127.0.0.1:${volume_port}/compute/versions?volume=${volume_id}" | head -c 400
+    echo
+    lease_id=$(printf '%s' "$lease_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("lease",""))' 2>/dev/null)
+    if [ -n "$lease_id" ]; then
+        curl -s -X POST \
+            "http://127.0.0.1:${volume_port}/compute/versions?volume=${volume_id}&action=release&lease=${lease_id}" >/dev/null
+        echo "released lease ${lease_id}"
+    fi
+done
+
+echo
 echo "== forcing reclamation with a 1s retention on each volume server =="
 for i in $(seq 0 $((VOLUME_COUNT - 1))); do
     volume_port=$((VOLUME_BASE + i))

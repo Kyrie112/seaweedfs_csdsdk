@@ -55,6 +55,10 @@
 
 **总记录**:[journal/2026-10-12-overall-summary.md](journal/2026-10-12-overall-summary.md)(M1–M4 完整汇总)。
 
+**健壮性增强(2026-10-19)**:参照 PostgreSQL MVCC / RCU epoch / etcd lease,
+把"最近使用 + TTL"升级为**租约 + 低水位回收**,并持久化代次。见
+[journal/2026-10-19-mvcc-hardening.md](journal/2026-10-19-mvcc-hardening.md)。
+
 **方案变更**:2026-10-12 决定采用"版本保留 + 引用计数 + 延迟回收"(MVCC 式)作为
 一致性的主路径——老任务读老版本、新写入追加为新版本、引用归零后 GC。
 M1 的检测能力由主路径退化为兜底。详见

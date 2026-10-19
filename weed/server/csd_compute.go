@@ -134,8 +134,41 @@ func (vs *VolumeServer) csdVersionsHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if r.Method == http.MethodPost {
-		removed := vol.GarbageCollectDataVersionsWithRetention(retention, storage.DefaultMaxRetainedVersions)
-		glog.V(0).Infof("volume %d: reclaimed %d data version(s) with retention %s", volumeId, len(removed), retention)
+		switch r.URL.Query().Get("action") {
+		case "lease":
+			// Hold a version for an explicit (test/ops) period.
+			generation, _ := strconv.ParseUint(r.URL.Query().Get("generation"), 10, 64)
+			leaseTTL := retention
+			if raw := r.URL.Query().Get("ttl"); raw != "" {
+				if parsed, err := time.ParseDuration(raw); err == nil {
+					leaseTTL = parsed
+				}
+			}
+			lease := vol.AcquireVersionLease(generation, leaseTTL)
+			glog.V(0).Infof("volume %d: acquired version lease %d on generation %d for %s",
+				volumeId, lease, generation, leaseTTL)
+			writeJsonQuiet(w, r, http.StatusOK, map[string]any{
+				"volume_id": volumeId.String(), "lease": lease,
+				"generation": generation, "ttl": leaseTTL.String(),
+			})
+			return
+		case "release":
+			lease, _ := strconv.ParseUint(r.URL.Query().Get("lease"), 10, 64)
+			vol.ReleaseVersionLease(lease)
+			glog.V(0).Infof("volume %d: released version lease %d", volumeId, lease)
+			writeJsonQuiet(w, r, http.StatusOK, map[string]any{
+				"volume_id": volumeId.String(), "released": lease,
+			})
+			return
+		default:
+			removed := vol.GarbageCollectDataVersionsWithRetention(retention, storage.DefaultMaxRetainedVersions)
+			glog.V(0).Infof("volume %d: reclaimed %d data version(s) with retention %s", volumeId, len(removed), retention)
+			writeJsonQuiet(w, r, http.StatusOK, map[string]any{
+				"volume_id": volumeId.String(), "reclaimed": removed,
+				"retention": retention.String(), "generation": vol.CurrentDataGeneration(),
+			})
+			return
+		}
 	}
 	writeJsonQuiet(w, r, http.StatusOK, csdVersionResponse{
 		VolumeId:   volumeId.String(),
@@ -210,7 +243,13 @@ func (vs *VolumeServer) tryHandleCSDCompute(
 		}
 	}
 
+	// M3/MVCC: pin the data version for the duration of the device read. The
+	// lease is released immediately after the call, so the version cannot be
+	// reclaimed while the device is reading it; if this process dies, the lease
+	// expires by TTL.
+	leaseID := vol.AcquireVersionLease(region.Generation, storage.DefaultVersionLeaseTTL)
 	result, timing, err := vs.callCSDCompute(r.Context(), operation, region, params)
+	vol.ReleaseVersionLease(leaseID)
 	if err != nil {
 		if errors.Is(err, errStaleRange) {
 			// Detectable inconsistency: report it instead of falling back, so a
