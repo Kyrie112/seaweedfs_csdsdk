@@ -15,7 +15,7 @@ offload 耗时作为设备侧计算基线。)
 
 ## 2. 实验 A:Server 上传带宽受限 → 主机端计算不足
 
-方法与数据见 `REPORT_SERVER.md`(filer `-downloadMaxMBps` 限速,176MB 文件):
+方法与数据见 `服务端资源受限实验.md`(filer `-downloadMaxMBps` 限速,176MB 文件):
 
 | Server 带宽 | host 总耗时 | offload 耗时 | 加速比 |
 |---|---|---|---|
@@ -57,7 +57,7 @@ offload 耗时作为设备侧计算基线。)
 - 失败模式:volume 的 Go HTTP 服务在 CPU 紧张时无法维持多个计算管道,请求以
   `compute operation "sum" failed: context canceled` 或连接错误快速失败。
 - 补充观察:把 volume 钉到单核再叠加 busy-loop(争抢)会导致单请求从 ~17s 恶化到数分钟且
-  sshd 失联(见 `REPORT_SERVER.md` 2.2),进一步说明服务器 CPU 争抢的脆弱性。
+  sshd 失联(见 `服务端资源受限实验.md` 2.2),进一步说明服务器 CPU 争抢的脆弱性。
 
 结论:**当前下沉把计算放在服务器 CPU 上,CPU 是共享、有限资源**;服务器 CPU 配额紧时,
 并发近存计算变慢甚至不可用。这是"必须把计算移出服务器 CPU(CSD)"的第二层证据。
@@ -78,7 +78,7 @@ CPU 配额下并发不可用)即为后续 CSD 部署的基线证据。
 ## 5. 复现
 
 ```bash
-# 实验 A(带宽):见 REPORT_SERVER.md
+# 实验 A(带宽):见 服务端资源受限实验.md
 ../scripts/run_server_experiments.sh all ../results/results_server.csv 3
 
 # 实验 B(CPU 配额 × 并发)

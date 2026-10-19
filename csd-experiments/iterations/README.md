@@ -7,13 +7,13 @@
 
 | 迭代 | 主题 | 状态 | 文档 |
 | --- | --- | --- | --- |
-| V0 | 脚本 + 临时文件计算(基线) | 已完成 | [ITERATION-00](ITERATION-00_script-baseline.md) |
-| V1 | 跨 chunk + 文件/对象/块多模态上层接口 | 已完成 | [ITERATION-01](ITERATION-01_multimodal-upper-interface.md) |
-| V2 | SeaweedFS CSD 原生分派 + SmartSSD agent | 已完成(部分集成) | [ITERATION-02](ITERATION-02_csd-native-region-dispatch.md) |
-| V3 | P2P / 盘直通 FPGA | 已完成(agent 侧真机验证) | [ITERATION-03](ITERATION-03_p2p-near-storage.md) |
-| V4 | 早期 CSD-aware 副本选择(CSD 优先 + 延迟) | 已完成 | [ITERATION-04](ITERATION-04_csd-aware-replica-scheduling.md) |
-| V5 | 增强 CSD-aware 调度(负载感知 + 原子预留 + 失败重试) | 已完成(单元验证) | [ITERATION-05](ITERATION-05_enhanced-csd-aware-scheduling.md) |
-| 对比 | P2P 直通 vs XRT 搬移 | 初步测量 | [COMPARISON-P2P-vs-XRT](COMPARISON_P2P_vs_XRT.md) |
+| V0 | 脚本 + 临时文件计算(基线) | 已完成 | [ITERATION-00](迭代00-脚本基线.md) |
+| V1 | 跨 chunk + 文件/对象/块多模态上层接口 | 已完成 | [ITERATION-01](迭代01-多模态接口.md) |
+| V2 | SeaweedFS CSD 原生分派 + SmartSSD agent | 已完成(部分集成) | [ITERATION-02](迭代02-CSD原生区间分派.md) |
+| V3 | P2P / 盘直通 FPGA | 已完成(agent 侧真机验证) | [ITERATION-03](迭代03-P2P近存通路.md) |
+| V4 | 早期 CSD-aware 副本选择(CSD 优先 + 延迟) | 已完成 | [ITERATION-04](迭代04-CSD感知调度.md) |
+| V5 | 增强 CSD-aware 调度(负载感知 + 原子预留 + 失败重试) | 已完成(单元验证) | [ITERATION-05](迭代05-负载感知调度.md) |
+| 对比 | P2P 直通 vs XRT 搬移 | 初步测量 | [COMPARISON-P2P-vs-XRT](P2P与XRT对比.md) |
 
 ## 文档维护约定
 
@@ -21,4 +21,4 @@
 2. 每篇文档必须包含:目的、路径图、代码位置、改动点、验证结果、当前限制、下一迭代;
 3. 若新迭代只完成部分集成,状态写“已完成(部分集成)”,并在文档中明确未完成部分;
 4. 文档应可独立阅读,论文可直接引用其中图表、路径与数据;
-5. 新迭代沿用 [ITERATION-03](ITERATION-03_p2p-near-storage.md) 中的章节模板。
+5. 新迭代沿用 [ITERATION-03](迭代03-P2P近存通路.md) 中的章节模板。

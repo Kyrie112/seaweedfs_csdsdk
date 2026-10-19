@@ -12,10 +12,10 @@
 
 | 文档 | 适用接口 | 计算入口 |
 | --- | --- | --- |
-| [SOP-01-FS.md](SOP-01-FS.md) | 文件存储 | filer HTTP `?compute=` 与 `/api/compute/file/...` |
-| [SOP-02-S3-Object.md](SOP-02-S3-Object.md) | 对象存储 | S3 `?x-compute=` / 请求头,以及 `/api/compute/object/...` |
-| [SOP-03-Block.md](SOP-03-Block.md) | 块存储(逻辑块卷) | `/api/compute/block/...` |
-| [SOP-04-Unified-API.md](SOP-04-Unified-API.md) | 统一计算入口 | `/api/compute/{file\|object\|block}/...` |
+| [操作规范01-文件接口.md](操作规范01-文件接口.md) | 文件存储 | filer HTTP `?compute=` 与 `/api/compute/file/...` |
+| [操作规范02-对象接口.md](操作规范02-对象接口.md) | 对象存储 | S3 `?x-compute=` / 请求头,以及 `/api/compute/object/...` |
+| [操作规范03-块接口.md](操作规范03-块接口.md) | 块存储(逻辑块卷) | `/api/compute/block/...` |
+| [操作规范04-统一接口.md](操作规范04-统一接口.md) | 统一计算入口 | `/api/compute/{file\|object\|block}/...` |
 
 ## 通用占位符
 

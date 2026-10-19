@@ -14,11 +14,11 @@
 > | `csd-experiments/reports/` | 论文初稿、阶段验证报告、项目总览 |
 > | `csd-experiments/results/` | 全部实验原始数据 |
 >
-> 一致性设计:[分布式一致性问题分析与开发计划](DISTRIBUTED_CONSISTENCY_PLAN.md)(开发过程记录见 [distributed-consistency/](distributed-consistency/README.md))
+> 一致性设计:[分布式一致性问题分析与开发计划](分布式一致性问题分析与开发计划.md)(开发过程记录见 [distributed-consistency/](distributed-consistency/README.md))
 >
-> 快速入口:[论文初稿](csd-experiments/reports/THESIS_DRAFT.md)、
-> [项目总览](csd-experiments/reports/REPORT_PROJECT_OVERVIEW.md)、
-> [路线图](csd-experiments/ROADMAP.md)、[设备侧模块](smartssd/README.md)。
+> 快速入口:[论文初稿](csd-experiments/reports/毕业论文初稿.md)、
+> [项目总览](csd-experiments/reports/项目总览汇报.md)、
+> [路线图](csd-experiments/后续工作路线图.md)、[设备侧模块](smartssd/README.md)。
 
 
 [![Slack](https://img.shields.io/badge/slack-purple)](https://join.slack.com/t/seaweedfs/shared_invite/enQtMzI4MTMwMjU2MzA3LTEyYzZmZWYzOGQ3MDJlZWMzYmI0OTE4OTJiZjJjODBmMzUxNmYwODg0YjY3MTNlMjBmZDQ1NzQ5NDJhZWI2ZmY)
